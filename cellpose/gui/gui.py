@@ -1391,7 +1391,7 @@ class MainW(QMainWindow):
         self.removing_cells_list.clear()
 
     def select_roi_by_id(self):
-        """Select a ROI/cell by ID number entered in the text input"""
+        """Select a ROI/cell by ID number entered in the text input and zoom to it"""
         try:
             roi_id = int(self.roi_id_input.text())
             # Check if ROI ID is valid
@@ -1399,7 +1399,25 @@ class MainW(QMainWindow):
                 self.unselect_cell()
                 self.select_cell(roi_id)
                 self.update_layer()
-                print(f"GUI_INFO: selected ROI {roi_id}")
+                
+                # Get ROI centroid and zoom to it
+                if (self.currentZ, roi_id) in self.cellcenters:
+                    cy, cx = self.cellcenters[(self.currentZ, roi_id)]
+                    # Calculate zoom level (show region ~200x200 pixels around centroid)
+                    zoom_size = 150
+                    # Set view range with padding
+                    x_min = max(0, cx - zoom_size)
+                    x_max = min(self.Lx, cx + zoom_size)
+                    y_min = max(0, cy - zoom_size)
+                    y_max = min(self.Ly, cy + zoom_size)
+                    
+                    # Apply zoom
+                    self.p0.setXRange(x_min, x_max, padding=0)
+                    self.p0.setYRange(y_min, y_max, padding=0)
+                    
+                    print(f"GUI_INFO: selected and zoomed to ROI {roi_id} at ({cy:.1f}, {cx:.1f})")
+                else:
+                    print(f"GUI_INFO: selected ROI {roi_id}")
             else:
                 print(f"GUI_ERROR: ROI ID {roi_id} out of range (1-{self.ncells.get()})")
                 self.roi_id_input.setStyleSheet("border: 1px solid red;")
