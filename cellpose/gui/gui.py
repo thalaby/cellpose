@@ -333,7 +333,6 @@ class MainW(QMainWindow):
         neighboring_cells = self.neighbors[self.selected]
         for idx in neighboring_cells:
             self.select_cell_multi(idx)
-    
         
 
         
@@ -1894,7 +1893,7 @@ class MainW(QMainWindow):
         if model_name is None or custom:
             self.get_model_path(custom=custom)
             if not os.path.exists(self.current_model_path):
-                raise ValueError("need to specify model (use dropdown)")
+                raise ValueError("Model file not found: need to specify model (use dropdown)")
 
         if model_name is None or not isinstance(model_name, str):
             self.model = models.CellposeModel(gpu=self.useGPU.isChecked(),
@@ -1991,7 +1990,7 @@ class MainW(QMainWindow):
                 self.logger.error("Flows don't exist, try running model again.")
                 return
             
-            maski = dynamics.resize_and_compute_masks(
+            maski = dynamics.compute_masks_and_clean(
                 dP=dP,
                 cellprob=cellprob,
                 niter=niter,
