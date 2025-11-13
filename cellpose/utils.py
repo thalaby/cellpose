@@ -744,8 +744,11 @@ def label_neighbors(masks: np.ndarray, connectivity: int = 4, ignore_label: int 
     if edges:
         labels_present = np.unique(L)
         labels_present = labels_present[labels_present != ignore_label]
-        neighbors = {int(lbl): [] for lbl in labels_present}
         for u, v in edges:
+            if v not in neighbors:
+                neighbors[v] = []
+            if u not in neighbors:
+                neighbors[u] = []
             neighbors[u].append(v)
             neighbors[v].append(u)
         for k in list(neighbors.keys()):

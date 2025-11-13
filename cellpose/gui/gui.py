@@ -312,11 +312,25 @@ class MainW(QMainWindow):
         THW = guiparts.TrainHelpWindow(self)
         THW.show()
     
+    def verify_safe_neighbors(self, z_plane):
+        if len(self.cellcenters) == 0:
+            self.logger.error("No masks loaded, try loading masks and then run this function.")
+            return False
+        if self.neighbors is None:
+            self.neighbors = [None for z in range(self.NZ)]
+        if self.neighbors[z_plane] is None:
+            self.neighbors[z_plane], _ = label_neighbors(self.cellpix[z_plane], connectivity=8)
+        return True
+
+
+    
     def calc_neighbors(self):
         if len(self.cellcenters) == 0:
             self.logger.error("No masks loaded, try loading masks and then run this function.")
             return
-        self.neighbors, _ = label_neighbors(self.cellpix[self.currentZ], connectivity=8)
+        for z in range(self.NZ):
+            if not self.verify_safe_neighbors(z):
+                return
         self.logger.info("Calculated neighbors for current masks.")
         filename = Path(os.path.splitext(self.filename)[0], "neighbors.npy")
         base = os.path.splitext(self.filename)[0]
@@ -328,9 +342,9 @@ class MainW(QMainWindow):
         if self.selected == 0:
             self.logger.error("Select specific cell for to show its neighboring cells.")
             return
-        if self.neighbors is None:
-            self.calc_neighbors()
-        neighboring_cells = self.neighbors[self.selected]
+        if not self.verify_safe_neighbors(self.currentZ):
+            return
+        neighboring_cells = self.neighbors[self.currentZ][self.selected]
         for idx in neighboring_cells:
             self.select_cell_multi(idx)
         
@@ -680,7 +694,7 @@ class MainW(QMainWindow):
     
     def add_roi_selector(self, b):
         widget_row = 0
-        self.roiBox = QGroupBox("roi selector")
+        self.roiBox = QGroupBox("ROI Selector")
         self.roiBoxG = QGridLayout()
         self.roiBox.setLayout(self.roiBoxG)
         self.l0.addWidget(self.roiBox, b, 0, 1, 9)
@@ -703,6 +717,13 @@ class MainW(QMainWindow):
         self.roi_select_btn.setFont(self.medfont)
         self.roi_select_btn.clicked.connect(self.select_roi_by_id)
         self.roiBoxG.addWidget(self.roi_select_btn, widget_row, 4, 1, 2)
+        widget_row += 1
+        # Add show-next-merge button
+        self.show_next_merge_btn = QPushButton("Show Next Merge")
+        self.show_next_merge_btn.setFont(self.smallfont)
+        self.show_next_merge_btn.setFixedWidth(110)
+        self.show_next_merge_btn.clicked.connect(self.show_next_merge_potential)
+        self.roiBoxG.addWidget(self.show_next_merge_btn, widget_row, 0, 1, 2)
 
 
     def make_buttons(self):
@@ -1053,6 +1074,8 @@ class MainW(QMainWindow):
                 self.sliders[r].show()
         self.currentZ = 0
         self.flows = [[], [], [], [], [[]]]
+        # index for iterating through merge-potential neighbors
+        self.current_merge_potential = 0
         # masks matrix
         # image matrix with a scale disk
         self.stack = np.zeros((1, self.Ly, self.Lx, 3))
@@ -1064,6 +1087,9 @@ class MainW(QMainWindow):
         self.cellcenters = np.zeros((0, 2), np.uint16)
         self.unique_ids = np.zeros(0, np.uint16)
         self.neighbors = None
+        self.flattened_neighbors = None
+        self.roi_id_by_size = {}
+        self.roi_id_by_size_sorted = []
         self.text_overlay = np.zeros((self.NZ, self.Ly, self.Lx, 4), np.uint8)
         self.outpix = np.zeros((1, self.Ly, self.Lx), np.uint16)
         self.ismanual = np.zeros(0, "bool")
@@ -1123,6 +1149,9 @@ class MainW(QMainWindow):
             self.cellcenters = np.zeros((0, 2), np.uint16)
             self.unique_ids = np.zeros(0, np.uint16)
             self.neighbors = None
+            self.flattened_neighbors = None
+            self.roi_id_by_size = {}
+            self.roi_id_by_size_sorted = []
             self.text_overlay = np.zeros((self.NZ, self.Ly, self.Lx, 4), np.uint8)
             self.outpix = np.zeros((self.NZ, self.Lyr, self.Lxr), np.uint16)
             self.cellpix_resize = self.cellpix.copy()
@@ -1389,13 +1418,24 @@ class MainW(QMainWindow):
         for idx in self.removing_cells_list:
             self.unselect_cell_multi(idx)
         self.removing_cells_list.clear()
-
-    def select_roi_by_id(self):
-        """Select a ROI/cell by ID number entered in the text input and zoom to it"""
-        try:
-            roi_id = int(self.roi_id_input.text())
-            # Check if ROI ID is valid
+    
+    def select_and_zoom(self, roi_id):
             if roi_id > 0 and roi_id <= self.ncells.get():
+                # Find the first Z-plane where this ROI exists
+                first_z = None
+                for z in range(self.NZ):
+                    if (z, roi_id) in self.cellcenters:
+                        first_z = z
+                        break
+                
+                # Navigate to that Z-plane if found
+                if first_z is not None:
+                    self.currentZ = first_z
+                    if self.NZ > 1:
+                        self.scroll.setValue(self.currentZ)
+                        self.zpos.setText(str(self.currentZ))
+                    self.update_plot()
+                
                 self.unselect_cell()
                 self.select_cell(roi_id)
                 self.update_layer()
@@ -1415,12 +1455,19 @@ class MainW(QMainWindow):
                     self.p0.setXRange(x_min, x_max, padding=0)
                     self.p0.setYRange(y_min, y_max, padding=0)
                     
-                    print(f"GUI_INFO: selected and zoomed to ROI {roi_id} at ({cy:.1f}, {cx:.1f})")
+                    print(f"GUI_INFO: selected and zoomed to ROI {roi_id} at Z={self.currentZ} ({cy:.1f}, {cx:.1f})")
                 else:
                     print(f"GUI_INFO: selected ROI {roi_id}")
             else:
                 print(f"GUI_ERROR: ROI ID {roi_id} out of range (1-{self.ncells.get()})")
                 self.roi_id_input.setStyleSheet("border: 1px solid red;")
+
+    def select_roi_by_id(self):
+        """Select a ROI/cell by ID number entered in the text input and zoom to it"""
+        try:
+            roi_id = int(self.roi_id_input.text())
+            self.select_and_zoom(roi_id)
+            
         except ValueError:
             print("GUI_ERROR: please enter a valid integer ROI ID")
             self.roi_id_input.setStyleSheet("border: 1px solid red;")
@@ -1428,6 +1475,33 @@ class MainW(QMainWindow):
         # Clear the text after selection
         self.roi_id_input.setText("")
         self.roi_id_input.setStyleSheet("")
+    
+    def show_next_merge_potential(self):
+        for z in range(self.NZ):
+            if not self.verify_safe_neighbors(z):
+                return
+        if self.flattened_neighbors is None:
+            self.flattened_neighbors = {}
+            for neigh in self.neighbors:
+                self.flattened_neighbors.update(neigh)
+        
+        if len(self.flattened_neighbors) == 0:
+            print("GUI_INFO: No mergeable neighbors found.")
+            return
+        prev_merge_potential = self.current_merge_potential
+        current_potential_cell_id = self.roi_id_by_size_sorted[self.current_merge_potential]
+        while current_potential_cell_id not in self.flattened_neighbors :
+            self.current_merge_potential += 1
+            if self.current_merge_potential >= len(self.roi_id_by_size_sorted):
+                self.current_merge_potential = 0
+            if self.current_merge_potential == prev_merge_potential:
+                print("GUI_INFO: No mergeable neighbors found.")
+                return
+            current_potential_cell_id = self.roi_id_by_size_sorted[self.current_merge_potential]
+        # current_potential_cell_id = list(current_neighbors.keys())[self.current_merge_potential]
+        self.select_and_zoom(current_potential_cell_id)
+        self.current_merge_potential += 1
+        self.logger.info(f"Selected {self.current_merge_potential}/{len(self.flattened_neighbors.keys())} mergeable neighbors.")
 
     def add_roi(self, roi):
         self.p0.addItem(roi)
