@@ -566,6 +566,18 @@ def _masks_to_gui(parent, masks, outlines=None, colors=None):
     parent.toggle_mask_ops()
     parent.ismanual = np.zeros(parent.ncells.get(), bool)
     parent.zdraw = list(-1 * np.ones(parent.ncells.get(), np.int16))
+    parent.current_merge_potential = 0
+    parent.roi_id_by_size = {}
+    labels = parent.cellpix.ravel()
+    counts = np.bincount(labels)
+
+    # ignore index 0 (background)
+    parent.roi_id_by_size = {
+        roi_id: counts[roi_id] for roi_id in range(1, parent.ncells.get() + 1)
+    }
+    parent.roi_id_by_size_sorted = sorted(
+        parent.roi_id_by_size, key=parent.roi_id_by_size.get)
+
 
     if hasattr(parent, "stack_filtered"):
         parent.ViewDropDown.setCurrentIndex(parent.ViewDropDown.count() - 1)
