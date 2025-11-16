@@ -151,11 +151,11 @@ def _load_image(parent, filename=None, load_seg=True, load_3D=False):
         if load_mask:
             _load_masks(parent, filename=mask_file)
 
-    # check if gray and adjust viewer:
-    if len(np.unique(image[..., 1:])) == 1:
-        parent.color = 4
-        parent.RGBDropDown.setCurrentIndex(4) # gray
-        parent.update_plot()
+    # # check if gray and adjust viewer:
+    # if len(np.unique(image[..., 1:])) == 1:
+    #     parent.color = 4
+    #     parent.RGBDropDown.setCurrentIndex(4) # gray
+    #     parent.update_plot()
 
         
 def _initialize_images(parent, image, load_3D=False):
@@ -591,15 +591,11 @@ def _save_png(parent):
     filename = parent.filename
     base = os.path.splitext(filename)[0]
     if parent.NZ == 1:
-        if parent.cellpix[0].max() > 65534:
-            print("GUI_INFO: saving 2D masks to tif (too many masks for PNG)")
-            imsave(base + "_cp_masks.tif", parent.cellpix[0])
-        else:
-            print("GUI_INFO: saving 2D masks to png")
-            imsave(base + "_cp_masks.png", parent.cellpix[0].astype(np.uint16))
+        print("GUI_INFO: saving 2D masks to tif (too many masks for PNG)")
+        imsave(base + "_masks.tif", parent.cellpix[0])
     else:
         print("GUI_INFO: saving 3D masks to tiff")
-        imsave(base + "_cp_masks.tif", parent.cellpix)
+        imsave(base + "_masks.tif", parent.cellpix)
 
 
 def _save_flows(parent):
