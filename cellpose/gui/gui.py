@@ -6,6 +6,7 @@ import sys, os, pathlib, warnings, datetime, time, copy
 
 from qtpy import QtGui, QtCore
 from superqt import QRangeSlider, QCollapsible
+import re
 from qtpy.QtWidgets import QScrollArea, QMainWindow, QApplication, QWidget, QScrollBar, \
     QComboBox, QGridLayout, QPushButton, QFrame, QCheckBox, QLabel, QProgressBar, \
         QLineEdit, QMessageBox, QGroupBox, QMenu, QAction
@@ -725,6 +726,12 @@ class MainW(QMainWindow):
         self.show_next_merge_btn.clicked.connect(self.show_next_merge_potential)
         self.roiBoxG.addWidget(self.show_next_merge_btn, widget_row, 0, 1, 2)
 
+        # Add load-next-file button next to show-next-merge
+        self.load_next_file_btn = QPushButton("Load Next File")
+        self.load_next_file_btn.setFont(self.smallfont)
+        self.load_next_file_btn.setFixedWidth(110)
+        self.load_next_file_btn.clicked.connect(self.load_next_file_by_index)
+        self.roiBoxG.addWidget(self.load_next_file_btn, widget_row, 2, 1, 2)
 
     def make_buttons(self):
         self.boldfont = QtGui.QFont("Arial", 11, QtGui.QFont.Bold)
@@ -978,6 +985,59 @@ class MainW(QMainWindow):
         images, idx = self.get_files()
         idx = (idx + 1) % len(images)
         io._load_image(self, filename=images[idx], load_seg=load_seg)
+
+    def load_next_file_by_index(self):
+        """
+        Load the next image/mask pair based on a trailing integer in the current filename.
+        Example: if current file is img_0.tif try img_1.tif and corresponding mask variants
+        ("_masks", "_cp_masks"). If not found, keep current files.
+        """
+        if not getattr(self, 'filename', None):
+            print("GUI_INFO: no file currently loaded")
+            return
+
+        folder = os.path.dirname(self.filename)
+        base = os.path.splitext(os.path.basename(self.filename))[0]
+        ext = os.path.splitext(self.filename)[1]
+
+        m = re.match(r"^(.*?)(\d+)$", base)
+        if not m:
+            print(f"GUI_INFO: filename '{base}' does not end with an integer. Cannot load next.")
+            return
+
+        prefix, num = m.group(1), m.group(2)
+        try:
+            num_i = int(num)
+        except ValueError:
+            print(f"GUI_INFO: couldn't parse trailing integer in '{base}'")
+            return
+
+        next_num = num_i + 1
+        next_base = f"{prefix}{next_num}"
+
+        # candidate image path
+        image_candidate = os.path.join(folder, next_base + ext)
+
+        # candidate mask name variants
+        mask_candidates = [f"{next_base}_masks{ext}", f"{next_base}_cp_masks{ext}", f"{next_base}_masks.tif", f"{next_base}_cp_masks.tif"]
+        mask_path = None
+        for mname in mask_candidates:
+            mpath = os.path.join(folder, mname)
+            if os.path.exists(mpath):
+                mask_path = mpath
+                break
+
+        if os.path.exists(image_candidate) and mask_path is not None:
+            # load image first, then explicitly load masks to ensure masks are applied
+            try:
+                io._load_image(self, filename=image_candidate, load_seg=False, load_3D=self.load_3D)
+                # load masks separately so they are guaranteed to be applied
+                io._load_masks(self, filename=mask_path)
+                print(f"GUI_INFO: loaded {image_candidate} and {os.path.basename(mask_path)}")
+            except Exception as e:
+                print(f"GUI_ERROR: failed to load next files: {e}")
+        else:
+            print(f"GUI_INFO: next files not found for base '{next_base}' - keeping current file")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
