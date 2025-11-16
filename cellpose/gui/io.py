@@ -491,6 +491,7 @@ def _masks_to_gui(parent, masks, outlines=None, colors=None):
     """ masks loaded into GUI """
     # get unique values
     shape = masks.shape
+    parent.original_masks = masks.copy()
     if len(fastremap.unique(masks)) != masks.max() + 1:
         print("GUI_INFO: renumbering masks")
         fastremap.renumber(masks, in_place=True)
@@ -559,7 +560,7 @@ def _masks_to_gui(parent, masks, outlines=None, colors=None):
     parent.cellcolors = np.concatenate((np.array([[255, 255, 255]]), colors),
                                        axis=0).astype(np.uint8)
     # TODO: extract this from the flows
-    parent.cellcenters = _find_centeroids(parent.cellpix)
+    parent.cellcenters = _find_centeroids(parent.original_masks)
     parent.unique_ids = np.asarray(list(parent.cellcenters.keys()))
     _build_text_overlay_3d(parent)    
     parent.draw_layer()
