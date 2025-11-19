@@ -957,12 +957,43 @@ class MainW(QMainWindow):
             self.remove_cell(self.selected)
 
     def undo_action(self):
-        if (len(self.strokes) > 0 and self.strokes[-1][0][0] == self.currentZ):
-            self.remove_stroke()
-        else:
-            # remove previous cell
-            if self.ncells > 0:
-                self.remove_cell(self.ncells.get())
+        """Undo the last operation (deletion, merge, etc.) by restoring saved mask state."""
+        self.restore_mask_state()
+
+    def save_mask_state(self):
+        """Save current mask state for undo. Call this before any mask-modifying operation."""
+        self.prev_masks = self.cellpix.copy()
+        self.prev_outpix = self.outpix.copy()
+        self.prev_cellcolors = self.cellcolors.copy()
+        self.prev_ismanual = self.ismanual.copy() if hasattr(self, 'ismanual') and len(self.ismanual) > 0 else np.array([], dtype=bool)
+        self.prev_cellcenters = dict(self.cellcenters) if isinstance(self.cellcenters, dict) else {}
+        self.prev_ncells = self.ncells.get()
+        self.undo_available = True
+        self.undo.setEnabled(True)
+        print("GUI_INFO: mask state saved for undo")
+
+    def restore_mask_state(self):
+        """Restore the previously saved mask state (undo operation)."""
+        if self.prev_masks is None:
+            print("GUI_INFO: no undo state available")
+            return
+        
+        self.cellpix = self.prev_masks.copy()
+        self.outpix = self.prev_outpix.copy()
+        self.cellcolors = self.prev_cellcolors.copy()
+        self.ismanual = self.prev_ismanual.copy() if len(self.prev_ismanual) > 0 else np.zeros(0, bool)
+        self.cellcenters = dict(self.prev_cellcenters)
+        self.ncells.set(self.prev_ncells)
+        
+        self.undo_available = False
+        self.prev_masks = None
+        self.undo.setEnabled(False)
+        
+        self.unselect_cell()
+        self.draw_layer()
+        self.update_layer()
+        self.update_plot()
+        print(f"GUI_INFO: restored mask state with {self.ncells.get()} cells")
 
     def undo_remove_action(self):
         self.undo_remove_cell()
@@ -1116,6 +1147,15 @@ class MainW(QMainWindow):
         self.zdraw = []
         self.removed_cell = []
         self.cellcolors = np.array([255, 255, 255])[np.newaxis, :]
+
+        # -- undo state -- #
+        self.prev_masks = None
+        self.prev_outpix = None
+        self.prev_cellcolors = None
+        self.prev_ismanual = None
+        self.prev_cellcenters = None
+        self.prev_ncells = 0
+        self.undo_available = False
 
         # -- zero out image stack -- #
         self.opacity = 128  # how opaque masks should be
@@ -1288,6 +1328,9 @@ class MainW(QMainWindow):
 
 
     def remove_single_cell(self, idx):
+        # Save state before removal for undo
+        self.save_mask_state()
+        
         # remove from manual array
         self.selected = 0
         if self.NZ > 1:
@@ -1378,6 +1421,8 @@ class MainW(QMainWindow):
             self.remove_roi(self.remove_roi_obj)
 
     def merge_cells(self, idx):
+        # Save state before merge for undo
+        
         self.prev_selected = self.selected
         self.selected = idx
         if self.selected != self.prev_selected:
