@@ -5,6 +5,7 @@ import logging
 import numpy as np
 from tqdm import trange
 from . import transforms, utils
+from torch.profiler import profile, record_function, ProfilerActivity
 
 import torch
 
@@ -161,6 +162,36 @@ def _forward(net, x):
     style = _from_device(style)
     return y, style
 
+def _forward_profile(net, x):
+    """Converts images to torch tensors, runs the network model, and returns numpy arrays.
+
+    Args:
+        net (torch.nn.Module): The network model.
+        x (numpy.ndarray): The input images.
+
+    Returns:
+        Tuple[numpy.ndarray, numpy.ndarray]: The output predictions (flows and cellprob) and style features.
+    """
+    X = _to_device(x, device=net.device, dtype=net.dtype)
+    net.eval()
+    with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    with_stack=False  # set True if you want Python stack traces (slower)
+                    ) as prof:
+        with record_function("train_step"):
+            with torch.no_grad():
+                y, style = net(X)[:2]
+    del X
+    # Save to text file
+    table_str = prof.key_averages().table(sort_by="cuda_time_total", row_limit=200)
+
+    with open("profiler_output.txt", "w") as f:
+        f.write(table_str)
+    y = _from_device(y)
+    style = _from_device(style)
+    return y, style
+
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             rsz=None):
@@ -227,7 +258,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         # run network
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya0, stylea0 = _forward(net, IMGa[bslc])
+            ya0, stylea0 = _forward_profile(net, IMGa[bslc])
             if j == 0:
                 nout = ya0.shape[1]
                 ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
