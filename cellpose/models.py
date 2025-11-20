@@ -10,7 +10,7 @@ import torch
 from scipy.ndimage import gaussian_filter
 import gc
 import cv2
-
+from mobile_sam import sam_model_registry
 import logging
 
 models_logger = logging.getLogger(__name__)
@@ -141,16 +141,17 @@ class CellposeModel():
 
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net = Transformer(dtype=dtype).to(self.device)
+        # self.net = Transformer(dtype=dtype).to(self.device)
+        self.net = sam_model_registry["vit_t"](checkpoint='./weights/mobile_sam.pt').image_encoder.to(self.device)
 
         if os.path.exists(self.pretrained_model):
             models_logger.info(f">>>> loading model {self.pretrained_model}")
-            self.net.load_model(self.pretrained_model, device=self.device)
+            # self.net.load_model(self.pretrained_model, device=self.device)
         else:
             if os.path.split(self.pretrained_model)[-1] != 'cpsam':
                 raise FileNotFoundError('model file not recognized')
             cache_CPSAM_model_path()
-            self.net.load_model(self.pretrained_model, device=self.device)
+            # self.net.load_model(self.pretrained_model, device=self.device)
         
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,

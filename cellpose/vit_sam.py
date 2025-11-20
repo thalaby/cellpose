@@ -8,6 +8,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 from torch import nn 
 import torch.nn.functional as F
 
+
 class Transformer(nn.Module):
     def __init__(self, backbone="vit_l", ps=8, nout=3, bsize=256, rdrop=0.4,
                   checkpoint=None, dtype=torch.float32):
@@ -53,7 +54,7 @@ class Transformer(nn.Module):
         if self.dtype != torch.float32:
             self = self.to(self.dtype)
 
-    def forward(self, x):      
+    def forward(self, x):     
         # same progression as SAM until readout
         x = self.encoder.patch_embed(x)
         
