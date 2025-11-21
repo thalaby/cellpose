@@ -16,6 +16,7 @@ dynamics_logger = logging.getLogger(__name__)
 from . import utils
 
 import torch
+import time
 import torch.nn.functional as F
 
 def _extend_centers_gpu(neighbors, meds, isneighbor, shape, n_iter=200, 
@@ -507,6 +508,9 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
             0=NO masks; 1,2,...=mask labels, size [Ly x Lx] or [Lz x Ly x Lx].
     """
     
+    timings = {}
+    t0 = time.time()
+    
     ndim = len(shape0)
     device = pt.device
     
@@ -515,9 +519,9 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     pt = torch.clamp(pt, min=0)
     for i in range(len(pt)):
         pt[i] = torch.clamp(pt[i], max=shape0[i]+rpad-1)
+    timings['clamp_pt'] = time.time() - t0
 
-    # # add extra padding to make divisible by 5
-    # shape = tuple((np.ceil((shape0 + 2*rpad)/5) * 5).astype(int))
+    t1 = time.time()
     shape = tuple(np.array(shape0) + 2*rpad)
 
     # sparse coo torch
@@ -525,25 +529,37 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
                                 shape)
     h1 = coo.to_dense()
     del coo
+    timings['sparse_to_dense'] = time.time() - t1
 
+    t2 = time.time()
     hmax1 = max_pool_nd(h1.unsqueeze(0), kernel_size=5)
     hmax1 = hmax1.squeeze()
     seeds1 = torch.nonzero((h1 - hmax1 > -1e-6) * (h1 > 10))
     del hmax1
+    timings['find_seeds'] = time.time() - t2
+    
     if len(seeds1) == 0:
         dynamics_logger.warning("no seeds found in get_masks_torch - no masks found.")
+        timings['total'] = time.time() - t0
+        print("get_masks_torch timings:", timings)
         return np.zeros(shape0, dtype="uint16")
     
+    t3 = time.time()
     npts = h1[tuple(seeds1.T)]
     isort1 = npts.argsort()
     seeds1 = seeds1[isort1]
+    timings['sort_seeds'] = time.time() - t3
 
+    t4 = time.time()
     n_seeds = len(seeds1)
     h_slc = torch.zeros((n_seeds, *[11]*ndim), device=seeds1.device)
     for k in range(n_seeds):
         slc = tuple([slice(seeds1[k][j]-5, seeds1[k][j]+6) for j in range(ndim)])
         h_slc[k] = h1[slc]
     del h1
+    timings['extract_slices'] = time.time() - t4
+    
+    t5 = time.time()
     seed_masks = torch.zeros((n_seeds, *[11]*ndim), device=seeds1.device)
     if ndim==2:
         seed_masks[:,5,5] = 1
@@ -555,22 +571,33 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
         seed_masks = max_pool_nd(seed_masks, kernel_size=3)
         seed_masks *= h_slc > 2
     del h_slc 
+    timings['extend_seed_masks'] = time.time() - t5
+    
+    t6 = time.time()
     seeds_new = [tuple((torch.nonzero(seed_masks[k]) + seeds1[k] - 5).T) 
             for k in range(n_seeds)]
     del seed_masks 
+    timings['extract_seeds_new'] = time.time() - t6
     
+    t7 = time.time()
     dtype = torch.int32 if n_seeds < 2**16 else torch.int64
     M1 = torch.zeros(shape, dtype=dtype, device=device)
     for k in range(n_seeds):
         M1[seeds_new[k]] = 1 + k
+    timings['create_M1'] = time.time() - t7
 
+    t8 = time.time()
     M1 = M1[tuple(pt)]
     M1 = M1.cpu().numpy()
+    timings['index_and_convert'] = time.time() - t8
 
+    t9 = time.time()
     dtype = "uint16" if n_seeds < 2**16 else "uint32"
     M0 = np.zeros(shape0, dtype=dtype)
     M0[inds] = M1
+    timings['create_M0'] = time.time() - t9
         
+    t10 = time.time()
     # remove big masks
     uniq, counts = fastremap.unique(M0, return_counts=True)
     big = np.prod(shape0) * max_size_fraction
@@ -579,8 +606,11 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
         M0 = fastremap.mask(M0, bigc)
     fastremap.renumber(M0, in_place=True)  #convenient to guarantee non-skipped labels
     M0 = M0.reshape(tuple(shape0))
+    timings['remove_big_masks'] = time.time() - t10
     
-    #print(f"mem used: {torch.cuda.memory_allocated()/1e9:.3f} gb, max mem used: {torch.cuda.max_memory_allocated()/1e9:.3f} gb")
+    timings['total'] = time.time() - t0
+    print("get_masks_torch timings:", timings)
+    
     return M0
 
 
@@ -643,49 +673,76 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
     Returns:
         tuple: A tuple containing the computed masks and the final pixel locations.
     """
-    
+    timings = {}
+    t0 = time.time()
     if (cellprob > cellprob_threshold).sum():  #mask at this point is a cell cluster binary map, not labels
+        t1 = time.time()
         inds = np.nonzero(cellprob > cellprob_threshold)
+        timings['find_inds'] = time.time() - t1
+
         if len(inds[0]) == 0:
             dynamics_logger.info("No cell pixels found.")
             shape = cellprob.shape
             mask = np.zeros(shape, "uint16")
+            timings['total'] = time.time() - t0
+            print("compute_masks timings:", timings)
             return mask
 
+        t2 = time.time()
         p_final = follow_flows(dP * (cellprob > cellprob_threshold) / 5., 
                                inds=inds, niter=niter, 
-                                device=device)
+                               device=device)
+        timings['follow_flows'] = time.time() - t2
+
+        t3 = time.time()
         if not torch.is_tensor(p_final):
             p_final = torch.from_numpy(p_final).to(device, dtype=torch.int)
         else:
             p_final = p_final.int()
-        # calculate masks
+        timings['convert_p_final'] = time.time() - t3
+
+        t4 = time.time()
         if device.type == "mps":
             p_final = p_final.to(torch.device("cpu"))
         mask = get_masks_torch(p_final, inds, dP.shape[1:], 
                                max_size_fraction=max_size_fraction)
+        timings['get_masks_torch'] = time.time() - t4
         del p_final
+
+        t5 = time.time()
         # flow thresholding factored out of get_masks
         if not do_3D:
             if mask.max() > 0 and flow_threshold is not None and flow_threshold > 0:
                 # make sure labels are unique at output of get_masks
                 mask = remove_bad_flow_masks(mask, dP, threshold=flow_threshold,
                                              device=device)
+        timings['remove_bad_flow_masks'] = time.time() - t5
 
+        t6 = time.time()
         if mask.max() < 2**16 and mask.dtype != "uint16":
             mask = mask.astype("uint16")
+        timings['astype_uint16'] = time.time() - t6
 
     else:  # nothing to compute, just make it compatible
         dynamics_logger.info("No cell pixels found.")
         shape = cellprob.shape
         mask = np.zeros(cellprob.shape, "uint16")
+        timings['total'] = time.time() - t0
+        print("compute_masks timings:", timings)
         return mask
-    
+
+    t7 = time.time()
     if min_size > 0:
         mask = utils.fill_holes_and_remove_small_masks(mask, min_size=min_size)
+    timings['fill_holes_and_remove_small_masks'] = time.time() - t7
 
+    t8 = time.time()
     if mask.dtype == np.uint32:
         dynamics_logger.warning(
             "more than 65535 masks in image, masks returned as np.uint32")
+    timings['check_uint32'] = time.time() - t8
+
+    timings['total'] = time.time() - t0
+    print("compute_masks timings:", timings)
 
     return mask
