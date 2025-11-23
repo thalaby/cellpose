@@ -7,6 +7,7 @@ from segment_anything import sam_model_registry
 torch.backends.cuda.matmul.allow_tf32 = True
 from torch import nn 
 import torch.nn.functional as F
+import time
 
 
 class Transformer(nn.Module):
@@ -54,7 +55,8 @@ class Transformer(nn.Module):
         if self.dtype != torch.float32:
             self = self.to(self.dtype)
 
-    def forward(self, x):     
+    def forward(self, x):
+        t0 = time.time()
         # same progression as SAM until readout
         x = self.encoder.patch_embed(x)
         
@@ -79,7 +81,7 @@ class Transformer(nn.Module):
         x1 = F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
         
         # maintain the second output of feature size 256 for backwards compatibility
-           
+        print(f"total forward: {time.time() - t0:.4f}s")
         return x1, torch.zeros((x.shape[0], 256), device=x.device)
     
     def load_model(self, PATH, device, strict = False):        

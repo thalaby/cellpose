@@ -261,7 +261,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 tile_overlap=tile_overlap)
             IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
                                             (ny * nx, nchan, ly, lx))
-        core_logger.info(f"Tile preparation time: {time.time() - t_tile_prep:.4f}s")
+        # core_logger.info(f"Tile preparation time: {time.time() - t_tile_prep:.4f}s")
         
         # run network
         t_forward = time.time()
@@ -274,7 +274,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 stylea = np.zeros((IMGa.shape[0], 256), "float32")
             ya[bslc] = ya0
             stylea[bslc] = stylea0
-        core_logger.info(f"Network forward pass time: {time.time() - t_forward:.4f}s")
+        # core_logger.info(f"Network forward pass time: {time.time() - t_forward:.4f}s")
 
         # average tiles
         t_avg = time.time()
@@ -289,8 +289,8 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 y = np.reshape(y, (-1, 3, ly, lx))
             yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
             yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
-        core_logger.info(f"Tile averaging time: {time.time() - t_avg:.4f}s")
-        core_logger.info(f"Total iteration time: {time.time() - t_iter:.4f}s")
+        # core_logger.info(f"Tile averaging time: {time.time() - t_avg:.4f}s")
+        # core_logger.info(f"Total iteration time: {time.time() - t_iter:.4f}s")
     
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]

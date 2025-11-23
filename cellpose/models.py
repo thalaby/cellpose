@@ -143,8 +143,8 @@ class CellposeModel():
 
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net = Transformer(dtype=dtype).to(self.device)
-        self.net1 = SAMStyleLongViT(device=self.device, dtype=dtype).to(self.device, dtype=dtype)
+        self.net1 = Transformer(dtype=dtype).to(self.device)
+        self.net = SAMStyleLongViT(device=self.device, dtype=dtype).to(self.device, dtype=dtype)
 
         if os.path.exists(self.pretrained_model):
             models_logger.info(f">>>> loading model {self.pretrained_model}")
