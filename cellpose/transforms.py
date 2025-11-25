@@ -564,7 +564,7 @@ def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
     # check if image is a torch array instead of numpy array, convert to numpy
     ndim = x.ndim
     if torch.is_tensor(x):
-        transforms_logger.warning("torch array used as input, converting to numpy")
+        # transforms_logger.warning("torch array used as input, converting to numpy")
         x = x.cpu().numpy()
 
     # should be 2D

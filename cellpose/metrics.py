@@ -117,6 +117,7 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
         threshold = [threshold]
 
     if len(masks_true) != len(masks_pred):
+        import ipdb; ipdb.set_trace()  # XXX DEBUG
         raise ValueError(
             "metrics.average_precision requires len(masks_true)==len(masks_pred)")
 
@@ -168,6 +169,7 @@ def _intersection_over_union(masks_true, masks_pred):
         subtracted to find the union matrix.
     """
     if masks_true.size != masks_pred.size:
+        import ipdb; ipdb.set_trace()  # XXX DEBUG
         raise ValueError("masks_true.size != masks_pred.size")
     overlap = _label_overlap(masks_true, masks_pred)
     overlap = overlap.toarray()

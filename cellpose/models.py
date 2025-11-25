@@ -11,7 +11,6 @@ from scipy.ndimage import gaussian_filter
 import gc
 import cv2
 from mobile_sam import sam_model_registry
-from .vit_tiny import SAMStyleLongViT
 import logging
 
 models_logger = logging.getLogger(__name__)
@@ -143,8 +142,7 @@ class CellposeModel():
 
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net1 = Transformer(dtype=dtype).to(self.device)
-        self.net = SAMStyleLongViT(device=self.device, dtype=dtype).to(self.device, dtype=dtype)
+        self.net = Transformer(dtype=dtype).to(self.device)
 
         if os.path.exists(self.pretrained_model):
             models_logger.info(f">>>> loading model {self.pretrained_model}")
@@ -161,12 +159,11 @@ class CellposeModel():
              flow_threshold=0.4, cellprob_threshold=0.0, do_3D=False, anisotropy=None,
              flow3D_smooth=0, stitch_threshold=0.0, 
              min_size=15, max_size_fraction=0.4, niter=None, 
-             augment=False, tile_overlap=0.1, bsize=1024, 
+             augment=False, tile_overlap=0.1, bsize=256, 
              compute_masks=True, progress=None):
         """ segment list of images x, or 4D array - Z x 3 x Y x X
         ... (docstring unchanged) ...
         """
-
 
         if rescale is not None:
             models_logger.warning("rescaling deprecated in v4.0.1+") 
@@ -347,7 +344,7 @@ class CellposeModel():
         timings['undo_resize'] = time.time() - t0
 
         timings['total'] = time.time() - t_start
-        models_logger.info(f"eval timings: {timings}")
+        # models_logger.info(f"eval timings: {timings}")
 
         return masks, [plot.dx_to_circ(dP), dP, cellprob], styles
     

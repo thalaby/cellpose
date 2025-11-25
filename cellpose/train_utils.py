@@ -1,153 +1,236 @@
 from torch.utils.data import Dataset
 from transformers import Trainer, TrainingArguments
+from cellpose import models
+from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch
+import os
+import re
 
-class SegmentationTileDataset(Dataset):
+class ImageMaskDataset(Dataset):
     """
-    Tiled dataset for segmentation:
-    returns (image tile, mask tile) pairs.
+    Loads image/mask pairs from a folder.
+    Expected format:
+        000_img.png
+        000_masks.png
+        001_img.png
+        001_masks.png
+        ...
     """
-    def __init__(self, sa1b_dataset, tile_size=256, dtype=torch.float32):
-        self.base = sa1b_dataset
-        self.tile_size = tile_size
+
+    def __init__(self, root_dir, img_suffix="_img.png", mask_suffix="_masks.png", dtype=torch.float32):
+        self.root_dir = root_dir
+        self.img_suffix = img_suffix
+        self.mask_suffix = mask_suffix
         self.dtype = dtype
-        self.samples = []  # list of (img_idx, y, x)
 
-        # Precompute tile coordinates for all images
-        for img_idx in range(len(self.base)):
-            img, mask, class_ids = self.base[img_idx]
-            img_arr = np.array(img)   # (H, W, C)
-            h, w = img_arr.shape[:2]
+        # Discover all prefixes (e.g., "000")
+        files = os.listdir(root_dir)
 
-            for y in range(0, h, tile_size):
-                for x in range(0, w, tile_size):
-                    self.samples.append((img_idx, y, x))
+        # Extract prefixes like "000" from names containing "_img.png"
+        self.prefixes = sorted([
+            re.match(r"(.*)" + re.escape(img_suffix), f).group(1)
+            for f in files
+            if f.endswith(img_suffix)
+        ])
 
-        print(f"SegmentationTileDataset: {len(self.samples)} tiles")
+        if len(self.prefixes) == 0:
+            raise RuntimeError(f"No {img_suffix} files found in directory: {root_dir}")
+
+        print(f"Found {len(self.prefixes)} samples in {root_dir}")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.prefixes)
 
     def __getitem__(self, idx):
-        img_idx, y, x = self.samples[idx]
-        img, mask, class_ids = self.base[img_idx]
+        prefix = self.prefixes[idx]
 
-        img_arr = np.array(img)     # (H, W, C)
-        mask_arr = np.array(mask)   # (H, W) or (H, W, 1)
+        img_path = os.path.join(self.root_dir, prefix + self.img_suffix)
+        mask_path = os.path.join(self.root_dir, prefix + self.mask_suffix)
 
-        H, W = img_arr.shape[:2]
-        ts = self.tile_size
+        # Load images
+        img = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path)
 
-        y_end = min(y + ts, H)
-        x_end = min(x + ts, W)
+        # Convert to numpy
+        img = np.array(img)           # (H, W, 3)
+        mask = np.array(mask)         # (H, W)
 
-        # 1) Crop both image and mask with the same bounds
-        img_tile = img_arr[y:y_end, x:x_end, :]               # (h', w', C)
-        mask_tile = mask_arr[y:y_end, x:x_end]                # (h', w') or (h', w', 1)
+        # Convert to torch tensors
+        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img = img.to(self.dtype)
 
-        # 2) Pad both to (ts, ts)
-        h_t, w_t = img_tile.shape[:2]
+        # Mask shape -> (1, H, W)
+        mask = torch.from_numpy(mask)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        else:
+            mask = mask.permute(2, 0, 1)[:1]
 
-        if h_t < ts or w_t < ts:
-            # image padding
-            padded_img = np.zeros((ts, ts, img_tile.shape[2]), dtype=img_tile.dtype)
-            padded_img[:h_t, :w_t, :] = img_tile
-            img_tile = padded_img
+        mask = mask.to(self.dtype)
 
-            # mask padding
-            if mask_tile.ndim == 2:
-                padded_mask = np.zeros((ts, ts), dtype=mask_tile.dtype)
-                padded_mask[:h_t, :w_t] = mask_tile
-            else:
-                padded_mask = np.zeros((ts, ts, mask_tile.shape[2]), dtype=mask_tile.dtype)
-                padded_mask[:h_t, :w_t, :] = mask_tile
-            mask_tile = padded_mask
-
-        # 3) To tensors
-        img_tile = img_tile.astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_tile).permute(2, 0, 1)   # (C, H, W)
-
-        mask_tensor = torch.from_numpy(mask_tile.astype(np.float32))
-        if mask_tensor.ndim == 2:
-            mask_tensor = mask_tensor.unsqueeze(0)                  # (1, H, W)
-        elif mask_tensor.ndim == 3:
-            mask_tensor = mask_tensor.permute(2, 0, 1)[:1]          # (1, H, W)
-
-        return {
-            "pixel_values": img_tensor.to(self.dtype),
-            "labels": mask_tensor.to(self.dtype),
-        }
+        return img, mask
 
 
 class StudentSegmentationModel(nn.Module):
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, device="cuda", dtype=torch.float32):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.device = device
+        self.dtype = dtype
+        self.dummy = torch.zeros((1, 256), device=device, dtype=dtype)
 
     def forward(self, x):
         feat = self.encoder(x)     # neck output
-        logits = self.decoder(feat)
-        return logits
+        out = self.decoder(feat)
+        return out, self.dummy
+
+class CellposeCustomModel(models.CellposeModel):
+    def __init__(self, gpu=True, nchan=3, custom_net=None, use_bfloat16=False):
+        super().__init__(gpu=gpu, nchan=nchan, use_bfloat16=use_bfloat16)
+        self.net = custom_net if custom_net is not None else self.net
+
     
 
 class DistillationDatasetWrapper(Dataset):
-    """Wrapper for SA1BDataset to work with HuggingFace Trainer
-    
-    Divides images into 256x256 tiles to handle variable image sizes.
     """
-    
-    def __init__(self, sa1b_dataset, tile_size=256, dtype=torch.float16):
-        self.dataset = sa1b_dataset
+    Wrapper that tiles one or multiple datasets into fixed-size image tiles.
+
+    - Accepts:
+        * a single Dataset, or
+        * a list/tuple of Datasets (e.g. [sa1b_dataset, img_mask_dataset1, img_mask_dataset2, ...])
+    - Each underlying dataset item may be:
+        * img
+        * (img, mask)
+        * (img, mask, class_ids)
+        * {"pixel_values": img_tensor, ...}
+    - This wrapper only uses the image and ignores masks/labels.
+    """
+
+    def __init__(self, datasets, tile_size=256, dtype=torch.float16):
+        # Allow passing a single dataset or a list of datasets
+        if not isinstance(datasets, (list, tuple)):
+            datasets = [datasets]
+
+        self.datasets = datasets
         self.tile_size = tile_size
         self.dtype = dtype
-        self.tiles = []
-        
-        # Pre-compute all tiles for all images
+        self.tiles = []  # will store numpy arrays of shape (tile_size, tile_size, C)
+
         self._create_tiles()
-    
+
+    def _extract_image_from_sample(self, sample):
+        """
+        Given a sample from an arbitrary dataset, extract the image component.
+
+        Supported formats:
+            - img
+            - (img, mask)
+            - (img, mask, class_ids)
+            - {"pixel_values": img_tensor, ...}
+        """
+        # Dict sample (e.g. HuggingFace-like)
+        if isinstance(sample, dict):
+            if "pixel_values" in sample:
+                img = sample["pixel_values"]
+            else:
+                # Fallback: take first value
+                img = next(iter(sample.values()))
+        # Tuple sample (img, mask, ...)
+        elif isinstance(sample, (list, tuple)):
+            img = sample[0]
+        else:
+            # Just an image
+            img = sample
+
+        return img
+
+    def _to_hwc_numpy(self, img):
+        """
+        Convert an image to HWC numpy array.
+        Supports:
+            - PIL.Image
+            - torch.Tensor in CHW or HWC
+            - np.ndarray in CHW or HWC
+        """
+        # PIL Image
+        if isinstance(img, Image.Image):
+            arr = np.array(img)
+            if arr.ndim == 2:  # grayscale
+                arr = arr[..., None]
+            return arr  # HWC
+
+        # Torch tensor
+        if torch.is_tensor(img):
+            arr = img.detach().cpu().numpy()
+            # (C, H, W) -> (H, W, C)
+            if arr.ndim == 3 and arr.shape[0] <= 4 and arr.shape[0] < arr.shape[-1]:
+                arr = np.transpose(arr, (1, 2, 0))
+            elif arr.ndim == 2:
+                arr = arr[..., None]
+            return arr
+
+        # Numpy array
+        arr = np.array(img)
+        # (C, H, W) -> (H, W, C)
+        if arr.ndim == 3 and arr.shape[0] <= 4 and arr.shape[0] < arr.shape[-1]:
+            arr = np.transpose(arr, (1, 2, 0))
+        elif arr.ndim == 2:
+            arr = arr[..., None]
+        return arr
+
     def _create_tiles(self):
-        """Create 256x256 tiles from all images in the dataset"""
-        for idx in range(len(self.dataset)):
-            img, mask, class_ids = self.dataset[idx]
-            img_array = np.array(img)  # (H, W, C)
-            height, width = img_array.shape[:2]
-            
-            # Extract tiles
-            for y in range(0, height, self.tile_size):
-                for x in range(0, width, self.tile_size):
-                    # Get tile boundaries (with padding if necessary)
-                    y_end = min(y + self.tile_size, height)
-                    x_end = min(x + self.tile_size, width)
-                    
-                    tile = img_array[y:y_end, x:x_end, :]
-                    
-                    # Pad tile if it's smaller than tile_size x tile_size
-                    if tile.shape[0] < self.tile_size or tile.shape[1] < self.tile_size:
-                        padded_tile = np.zeros((self.tile_size, self.tile_size, tile.shape[2]), 
-                                              dtype=tile.dtype)
-                        padded_tile[:tile.shape[0], :tile.shape[1], :] = tile
-                        tile = padded_tile
-                    
-                    self.tiles.append(tile)
-        
-    
+        """Create tiles from all images in all datasets."""
+        tile_size = self.tile_size
+
+        for ds_idx, ds in enumerate(self.datasets):
+            for idx in range(len(ds)):
+                sample = ds[idx]
+                img = self._extract_image_from_sample(sample)
+                img_array = self._to_hwc_numpy(img)  # (H, W, C)
+
+                H, W = img_array.shape[:2]
+
+                for y in range(0, H, tile_size):
+                    for x in range(0, W, tile_size):
+                        y_end = min(y + tile_size, H)
+                        x_end = min(x + tile_size, W)
+
+                        tile = img_array[y:y_end, x:x_end, :]
+
+                        # Pad tile if needed
+                        h_t, w_t = tile.shape[:2]
+                        if h_t < tile_size or w_t < tile_size:
+                            padded = np.zeros(
+                                (tile_size, tile_size, tile.shape[2]),
+                                dtype=tile.dtype
+                            )
+                            padded[:h_t, :w_t, :] = tile
+                            tile = padded
+
+                        self.tiles.append(tile)
+
+        print(f"DistillationDatasetWrapper: created {len(self.tiles)} tiles "
+              f"from {len(self.datasets)} dataset(s).")
+
     def __len__(self):
         return len(self.tiles)
-    
+
     def __getitem__(self, idx):
         tile = self.tiles[idx]
-        
+
         # Normalize to [0, 1]
         tile = tile.astype(np.float32) / 255.0
-        # Convert to tensor and permute to (C, H, W)
+
+        # (H, W, C) -> (C, H, W)
         img_tensor = torch.from_numpy(tile).permute(2, 0, 1)
-        # Convert to the model's dtype
+
+        # Cast to desired dtype
         img_tensor = img_tensor.to(self.dtype)
-        
+
         return {"pixel_values": img_tensor}
     
 

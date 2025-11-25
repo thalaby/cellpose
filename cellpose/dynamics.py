@@ -541,7 +541,6 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     if len(seeds1) == 0:
         dynamics_logger.warning("no seeds found in get_masks_torch - no masks found.")
         timings['total'] = time.time() - t0
-        print("get_masks_torch timings:", timings)
         return np.zeros(shape0, dtype="uint16")
     
     t3 = time.time()
@@ -609,7 +608,6 @@ def get_masks_torch(pt, inds, shape0, rpad=20, max_size_fraction=0.4):
     timings['remove_big_masks'] = time.time() - t10
     
     timings['total'] = time.time() - t0
-    print("get_masks_torch timings:", timings)
     
     return M0
 
@@ -685,7 +683,6 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
             shape = cellprob.shape
             mask = np.zeros(shape, "uint16")
             timings['total'] = time.time() - t0
-            print("compute_masks timings:", timings)
             return mask
 
         t2 = time.time()
@@ -728,7 +725,6 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
         shape = cellprob.shape
         mask = np.zeros(cellprob.shape, "uint16")
         timings['total'] = time.time() - t0
-        print("compute_masks timings:", timings)
         return mask
 
     t7 = time.time()
@@ -743,6 +739,5 @@ def compute_masks(dP, cellprob, p=None, niter=200, cellprob_threshold=0.0,
     timings['check_uint32'] = time.time() - t8
 
     timings['total'] = time.time() - t0
-    print("compute_masks timings:", timings)
 
     return mask

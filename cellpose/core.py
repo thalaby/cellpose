@@ -238,7 +238,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
         nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
     
-    core_logger.info(f"Setup time: {time.time() - t0:.4f}s")
+    # core_logger.info(f"Setup time: {time.time() - t0:.4f}s")
     
     # run multiple slices at the same time
     ntiles = ny * nx
