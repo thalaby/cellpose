@@ -12,6 +12,9 @@ from train_utils import (
     TransformerWrapper,
     StudentSegmentationModel,
     CellposeCustomModel,
+    TiffImageDataset,
+    DistillationDatasetWrapperIndex,
+    TiledImageDirDataset
 )
 from torch import nn
 from transformers import TrainingArguments
@@ -21,6 +24,7 @@ from pathlib import Path
 import torch
 import logging
 import numpy as np
+import wandb
 
 # Configure logging to print to stdout
 logging.basicConfig(
@@ -34,6 +38,14 @@ MODEL_PATH = (
 
 CELLPOSE_DATASET_PATH = (
     "/storage/timorhalabi/Research/Data/CellDatasets/Cellpose"
+)
+
+CELLPOSEN_DATASET_PATH = (
+    "/storage/timorhalabi/Research/Data/CellDatasets/CellposeN"
+)
+
+SA1B_DATASET_PATH = (
+    "/storage/timorhalabi/Research/cellpose/SA-1B/tiled_images"
 )
 
 
@@ -50,7 +62,6 @@ def evaluate_on_masks(
 ):
     tiny_network = StudentSegmentationModel(student_encoder, student_decoder).to(device)
     model = CellposeCustomModel(gpu=True, nchan=3, use_bfloat16=False, custom_net=tiny_network)
-    import ipdb; ipdb.set_trace()
     
 
     loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -94,35 +105,40 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "output_dir": output_dir,
         "overwrite_output_dir": True,
         "num_train_epochs": 3,
-        "per_device_train_batch_size": 4,
+        "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 1,
         "learning_rate": 1e-4,
         "warmup_steps": 500,
         "weight_decay": 0.01,
         "logging_dir": "./logs",
         "logging_steps": 100,
-        "save_steps": 500,
+        "save_steps": 5000,
         "save_total_limit": 3,
         "seed": 42,
         "fp16": False,  # Disable FP16 since models are already float16
         "gradient_accumulation_steps": 1,
         "remove_unused_columns": False,
+        "report_to": "wandb",
+        "logging_steps": 10,
+        "dataloader_num_workers": 8,
+        "ddp_find_unused_parameters": False,
     }
     default_args.update(kwargs)
     return TrainingArguments(**default_args)
 
 
 def main(
-    dataset_dir="../SA-1B",
+    dataset_dir="../SA-1B/images",
     output_dir="./distillation_output",
     num_epochs=3,
-    batch_size=4,
+    batch_size=64,
     learning_rate=1e-4,
     batch_size_eval=1,
 ):
     """Main training function"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
+
 
     logger.info(f"Using device: {device}, dtype: {dtype}")
     train = True
@@ -140,14 +156,17 @@ def main(
     # Load dataset
     logger.info(f"Loading datasets ...")
 
-    logger.info(f"Loading sa1b dataset from {dataset_dir}...")
-    sa1b_dataset = SA1BDataset(dataset_dir=dataset_dir)
-    logger.info(f"sa1b loaded with {len(sa1b_dataset)} samples.")
+    logger.info(f"Loading datasets from {dataset_dir}...")
+    # sa1b_dataset = TiffImageDataset(SA1B_DATASET_PATH)
+    sa1b_dataset = TiledImageDirDataset(dataset_dir, dtype=dtype)
+    cellpose_train_dataset = TiledImageDirDataset(root_dir=Path(CELLPOSE_DATASET_PATH, 'train'), dtype=dtype)
+    cellposen_train_dataset = TiledImageDirDataset(root_dir=Path(CELLPOSEN_DATASET_PATH, 'train'), dtype=dtype)
+    logger.info(f"sa1b loaded with {len(sa1b_dataset)}, cellpose train dataset loaded with {len(cellpose_train_dataset)}, cellposen train dataset loaded with {len(cellposen_train_dataset)} samples.")
 
-    cellpose_train_dataset = ImageMaskDataset(root_dir=Path(CELLPOSE_DATASET_PATH, 'train'), dtype=dtype)
     logger.info(f"cellpose train dataset loaded with {len(cellpose_train_dataset)} samples.")
     if train:
-        train_dataset = DistillationDatasetWrapper([sa1b_dataset, cellpose_train_dataset], dtype=dtype)
+        # train_dataset = DistillationDatasetWrapper(processed_datasets=[sa1b_dataset], unprocessed_datasets=[cellpose_train_dataset, cellposen_train_dataset], dtype=dtype)
+        train_dataset = DistillationDatasetWrapperIndex(datasets=[sa1b_dataset, cellpose_train_dataset, cellposen_train_dataset])
 
         logger.info(f"Train tiles: {len(train_dataset)}")
 
@@ -185,6 +204,8 @@ def main(
     val_seg_dataset = ImageMaskDataset(root_dir=Path(CELLPOSE_DATASET_PATH, 'test'), dtype=dtype)
     metrics = evaluate_on_masks(
         student_encoder, student_decoder, val_seg_dataset, device=device, batch_size=batch_size_eval, teacher_model=teacher_model)
+    
+    np.savez(f"{output_dir}/segmentation_metrics.npz", **metrics)
     mean_ap = metrics["ap"].mean()
     logger.info(f"Segmentation eval: {mean_ap}")
 

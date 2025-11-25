@@ -3,6 +3,8 @@ import os
 from PIL import Image
 import numpy as np
 import os, json
+from tqdm import tqdm
+
 
 def load_sample(root, id, annotation_dir='annotations',image_dir='images'):
     img = os.path.join(root,image_dir,id+".jpg") 
@@ -34,57 +36,68 @@ class SA1BDataset:
         """
         super().__init__()
         if ids is None:
-            ids = [file.replace(".json",'') for file in os.listdir(os.path.join(dataset_dir,annotation_dir))]
-            
+            ids = [
+                file.replace(".json", "")
+                for file in os.listdir(os.path.join(dataset_dir, annotation_dir))
+            ]
+
         self.min_object = min_object
-        self.samples = [load_sample(dataset_dir,id,annotation_dir,image_dir) for id in ids]
-        self.image_info=[]
-        for img,info in self.samples:
-            self.image_info.append(json.load(open(info)))
+
+        # Progress bar for loading samples
+        self.samples = [
+            load_sample(dataset_dir, id, annotation_dir, image_dir)
+            for id in tqdm(ids, desc="Loading samples", unit="file")
+        ]
+
+        # Progress bar for loading image info
+        self.image_info = []
+        # for _, info in tqdm(self.samples, desc="Loading image info", unit="image"):
+        #     with open(info, "r") as f:
+        #         self.image_info.append(json.load(f))
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, index):
         img = Image.open(self.samples[index][0])
-        mask, class_ids = self.load_mask(index)
-        return img, mask, class_ids
+        # mask, class_ids = self.load_mask(index)
+        return img
     
-    def load_mask(self, idx):
-        """Load instance masks for the given image.
-        Different datasets use different ways to store masks. This
-        function converts the different mask format to one format
-        in the form of a bitmap [height, width, instances].
-        Returns:
-        masks: A bool array of shape [height, width, instance count] with
-            one mask per instance.
-        class_ids: a 1D array of class IDs of the instance masks.
-        """
-        # If not a COCO image, delegate to parent class.
-        image_info = self.image_info[idx]
+    # def load_mask(self, idx):
+    #     """Load instance masks for the given image.
+    #     Different datasets use different ways to store masks. This
+    #     function converts the different mask format to one format
+    #     in the form of a bitmap [height, width, instances].
+    #     Returns:
+    #     masks: A bool array of shape [height, width, instance count] with
+    #         one mask per instance.
+    #     class_ids: a 1D array of class IDs of the instance masks.
+    #     """
+    #     # If not a COCO image, delegate to parent class.
+    #     image_info = self.image_info[idx]
         
-        instance_masks = []
-        class_ids = []
-        annotations = image_info["annotations"]
-        image_info = image_info['image']
-        # Build mask of shape [height, width, instance_count] and list
-        # of class IDs that correspond to each channel of the mask.
-        for annotation in annotations:
-            m = self.annToMask(annotation, image_info["height"],
-                                image_info["width"])
-            # Some objects are so small that they're less than 1 pixel area
-            # and end up rounded out. Skip those objects.
-            if m.sum() < self.min_object:
-                continue
-            class_id = annotation['id']
-            instance_masks.append(m)
-            class_ids.append(class_id)
+    #     instance_masks = []
+    #     class_ids = []
+    #     annotations = image_info["annotations"]
+    #     image_info = image_info['image']
+    #     # Build mask of shape [height, width, instance_count] and list
+    #     # of class IDs that correspond to each channel of the mask.
+    #     for annotation in annotations:
+    #         m = self.annToMask(annotation, image_info["height"],
+    #                             image_info["width"])
+    #         # Some objects are so small that they're less than 1 pixel area
+    #         # and end up rounded out. Skip those objects.
+    #         if m.sum() < self.min_object:
+    #             continue
+    #         class_id = annotation['id']
+    #         instance_masks.append(m)
+    #         class_ids.append(class_id)
 
-        # Pack instance masks into an array
+    #     # Pack instance masks into an array
         
-        mask = np.stack(instance_masks, axis=2)
-        class_ids = np.array(class_ids, dtype=np.int32)
-        return mask, class_ids
+    #     mask = np.stack(instance_masks, axis=2)
+    #     class_ids = np.array(class_ids, dtype=np.int32)
+    #     return mask, class_ids
 
 
     # The following two functions are from pycocotools with a few changes.
