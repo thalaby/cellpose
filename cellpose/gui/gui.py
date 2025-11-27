@@ -1309,6 +1309,46 @@ class MainW(QMainWindow):
             # [0,0,0,self.opacity])
         self.update_layer()
 
+    def remove_cell_from_current_z(self, idx):
+        """Remove a cell mask only from the current Z-plane (3D mode)."""
+        # Save state before removal for undo
+        self.save_mask_state()
+        
+        z = self.currentZ
+        cp = self.cellpix[z] == idx
+        op = self.outpix[z] == idx
+        
+        # Check if this cell exists on this plane
+        if not cp.any():
+            print(f"GUI_INFO: cell {idx} not found on Z-plane {z}")
+            return
+        
+        # Remove from current Z-plane only
+        self.cellpix[z, cp] = 0
+        self.outpix[z, op] = 0
+        self.layerz[cp] = np.array([0, 0, 0, 0])
+        
+        # Check if this cell still exists on any other Z-plane
+        cell_exists_elsewhere = (self.cellpix == idx).any()
+        
+        if not cell_exists_elsewhere:
+            # If cell no longer exists anywhere, remove it completely and reindex
+            self.cellpix[self.cellpix > idx] -= 1
+            self.outpix[self.outpix > idx] -= 1
+            self.ismanual = np.delete(self.ismanual, idx - 1)
+            self.cellcolors = np.delete(self.cellcolors, [idx], axis=0)
+            del self.zdraw[idx - 1]
+            self.ncells -= 1
+            print(f"GUI_INFO: removed cell {idx} completely (was only on Z={z})")
+        else:
+            print(f"GUI_INFO: removed cell {idx} from Z-plane {z} (still exists on other planes)")
+        
+        self.update_layer()
+        if self.ncells == 0:
+            self.ClearButton.setEnabled(False)
+        if self.NZ == 1:
+            io._save_sets_with_check(self)
+
     def remove_cell(self, idx):
         if isinstance(idx, (int, np.integer)):
             idx = [idx]

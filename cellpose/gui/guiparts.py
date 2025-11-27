@@ -655,7 +655,11 @@ class ImageDraw(pg.ImageItem):
                         if idx > 0:
                             if ev.modifiers() & QtCore.Qt.ControlModifier:
                                 # delete mask selected
-                                self.parent.remove_cell(idx)
+                                # In 3D mode, only delete from current Z-plane; in 2D, delete entire cell
+                                if self.parent.NZ > 1:
+                                    self.parent.remove_cell_from_current_z(idx)
+                                else:
+                                    self.parent.remove_cell(idx)
                             elif ev.modifiers() & QtCore.Qt.AltModifier:
                                 self.parent.merge_cells(idx)
                             elif self.parent.masksOn and not self.parent.deleting_multiple:
