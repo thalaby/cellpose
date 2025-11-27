@@ -1956,11 +1956,16 @@ class MainW(QMainWindow):
         if self.roisOn:
             # self.layerz[self.text_overlay[..., -1] > 0] = self.text_overlay[self.text_overlay[..., -1] > 0]
             # z is the current slice index you’re displaying
-            ov = self.text_overlay[self.currentZ]                 # (Ly, Lx, 4)
-            mask = ov[..., 3] > 0                     # (Ly, Lx) – alpha>0
-            mask4 = mask[..., None]                   # (Ly, Lx, 1) for channel-wise broadcast
-            # Replace only where text exists
-            self.layerz = np.where(mask4, ov, self.layerz)   # both (Ly, Lx, 4), dtype uint8
+            # Ensure text_overlay has correct size for current Z-stack
+            if self.currentZ < self.text_overlay.shape[0]:
+                ov = self.text_overlay[self.currentZ]                 # (Ly, Lx, 4)
+                mask = ov[..., 3] > 0                     # (Ly, Lx) – alpha>0
+                mask4 = mask[..., None]                   # (Ly, Lx, 1) for channel-wise broadcast
+                # Replace only where text exists
+                self.layerz = np.where(mask4, ov, self.layerz)   # both (Ly, Lx, 4), dtype uint8
+            elif self.text_overlay.shape[0] != self.NZ:
+                # Resize text_overlay if NZ changed
+                self.text_overlay = np.zeros((self.NZ, self.Ly, self.Lx, 4), np.uint8)
 
 
     def set_normalize_params(self, normalize_params):
