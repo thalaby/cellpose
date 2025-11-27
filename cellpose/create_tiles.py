@@ -66,7 +66,8 @@ def main():
     parser.add_argument(
         "--B",
         type=int,
-        help="Tile size B (tiles will be BxB).",
+        required=True,
+        help="Tile size B (tiles will be BxB). Required argument.",
     )
     parser.add_argument(
         "--ds-idx",

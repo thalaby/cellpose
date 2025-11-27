@@ -1,30 +1,23 @@
 from vit_sam import Transformer
 from vit_tiny import SAMStyleTinyViTEncoder, SAMStyleTinyViTDecoder
-from sa import SA1BDataset
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
+from dataset_utils import get_train_dataset, get_test_dataset
+from settings import MODEL_PATH, TRAINING_ARGS
 
 from train_utils import (
-    ImageMaskDataset,
-    DistillationDatasetWrapper,
     DistillationModel,
     DistillationTrainer,
     TransformerWrapper,
     StudentSegmentationModel,
     CellposeCustomModel,
-    TiffImageDataset,
-    DistillationDatasetWrapperIndex,
-    TiledImageDirDataset
 )
 from torch import nn
+from safetensors.torch import load_file
 from transformers import TrainingArguments
 from logging import getLogger
-from cellpose import metrics
-from pathlib import Path
 import torch
 import logging
 import numpy as np
-import wandb
+# import wandb
 
 # Configure logging to print to stdout
 logging.basicConfig(
@@ -32,56 +25,14 @@ logging.basicConfig(
 )
 
 logger = getLogger(__name__)
-MODEL_PATH = (
-    "/storage/timorhalabi/Research/Data/current/model/cellpose_iteration1_anisotropy"
-)
-
-CELLPOSE_DATASET_PATH = (
-    "/storage/timorhalabi/Research/Data/CellDatasets/Cellpose"
-)
-
-CELLPOSEN_DATASET_PATH = (
-    "/storage/timorhalabi/Research/Data/CellDatasets/CellposeN"
-)
-
-SA1B_DATASET_PATH = (
-    "/storage/timorhalabi/Research/cellpose/SA-1B/tiled_images"
-)
 
 
-def dice_coef(pred, target, eps=1e-6):
-    # pred, target: (B, 1, H, W), 0/1
-    intersection = (pred * target).sum(dim=(1, 2, 3))
-    union = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
-    dice = (2.0 * intersection + eps) / (union + eps)
-    return dice.mean().item()
 
-
-def evaluate_on_masks(
-    student_encoder, student_decoder, val_dataset, device="cuda", batch_size=1, teacher_model=None
-):
+def create_cellpose_model(student_encoder, student_decoder, device="cuda"):
+    """Helper function to create a CellposeCustomModel from student encoder/decoder"""
     tiny_network = StudentSegmentationModel(student_encoder, student_decoder).to(device)
     model = CellposeCustomModel(gpu=True, nchan=3, use_bfloat16=False, custom_net=tiny_network)
-    
-
-    loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    masks_gt_all =[]
-    masks_pred_all =[]
-    with torch.no_grad():
-        for batch in loader:
-            x = batch[0][0].permute((1, 2, 0)).to(device)  # (B, 3, 256, 256)
-            masks_gt = batch[1][0]  # (B, 1, 256, 256), 0/1
-            masks_gt = masks_gt.squeeze(1).numpy().astype(np.int16)
-            masks, flows, styles = model.eval(x)  # (B, 3, 256, 256) assumed
-            ap, tp, fp, fn = metrics.average_precision(masks_gt, masks)
-            print(ap[0], tp[0], fp[0], fn[0])
-            masks_gt_all.append(masks_gt)
-            masks_pred_all.append(masks)
-
-    threshold = np.arange(0.5, 1, 0.05)
-    
-    ap, tp, fp, fn = metrics.average_precision(masks_gt_all, masks_pred_all, threshold=threshold)
-    return {"ap": ap, "tp": tp, "fp": fp, "fn": fn}
+    return model
 
 
 def load_models(device="cuda", dtype=torch.float16):
@@ -111,27 +62,24 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "warmup_steps": 500,
         "weight_decay": 0.01,
         "logging_dir": "./logs",
-        "logging_steps": 100,
+        "logging_steps": 10,
         "save_steps": 5000,
         "save_total_limit": 3,
         "seed": 42,
         "fp16": False,  # Disable FP16 since models are already float16
         "gradient_accumulation_steps": 1,
         "remove_unused_columns": False,
-        "report_to": "wandb",
-        "logging_steps": 10,
+        "report_to": "none",
         "dataloader_num_workers": 8,
-        "ddp_find_unused_parameters": False,
     }
     default_args.update(kwargs)
     return TrainingArguments(**default_args)
 
 
 def main(
-    dataset_dir="../SA-1B/images",
     output_dir="./distillation_output",
     num_epochs=3,
-    batch_size=64,
+    batch_size=TRAINING_ARGS["train_batch_size"],
     learning_rate=1e-4,
     batch_size_eval=1,
 ):
@@ -139,9 +87,7 @@ def main(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
 
-
     logger.info(f"Using device: {device}, dtype: {dtype}")
-    train = True
     # Load encoders
     logger.info("Loading student and teacher encoders...")
     student_encoder, teacher_encoder, student_decoder, teacher_model = load_models(
@@ -150,66 +96,70 @@ def main(
 
     # Create distillation model
     logger.info("Creating distillation model...")
+    logger.info("Loading student encoder state dict from previous SA1B training...")
+    # student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
     distillation_model = DistillationModel(student_encoder, teacher_encoder)
+    distillation_model.to(device, dtype=dtype)
+    state_dict = load_file('good_checkpoints/checkpoint-post-sa-1b/model.safetensors', device='cpu')
+    distillation_model.load_state_dict(state_dict)
     distillation_model.to(device, dtype=dtype)
 
     # Load dataset
-    logger.info(f"Loading datasets ...")
+    
+    # wandb.init(project="cellpose_distillation", name="distillation_run")
+    
+    # Create evaluation dataset from multiple paths
+    logger.info("Creating evaluation dataset...")
+    eval_dataset = get_test_dataset()
+    logger.info(f"Eval tiles: {len(eval_dataset)}")
 
-    logger.info(f"Loading datasets from {dataset_dir}...")
-    # sa1b_dataset = TiffImageDataset(SA1B_DATASET_PATH)
-    sa1b_dataset = TiledImageDirDataset(dataset_dir, dtype=dtype)
-    cellpose_train_dataset = TiledImageDirDataset(root_dir=Path(CELLPOSE_DATASET_PATH, 'train'), dtype=dtype)
-    cellposen_train_dataset = TiledImageDirDataset(root_dir=Path(CELLPOSEN_DATASET_PATH, 'train'), dtype=dtype)
-    logger.info(f"sa1b loaded with {len(sa1b_dataset)}, cellpose train dataset loaded with {len(cellpose_train_dataset)}, cellposen train dataset loaded with {len(cellposen_train_dataset)} samples.")
+    logger.info("Creating training dataset...")
+    train_dataset = get_train_dataset()
+    logger.info(f"Train tiles: {len(train_dataset)}")
+    
+    # Create cellpose model for evaluation
+    cellpose_model = create_cellpose_model(student_encoder, student_decoder, device=device)
+    
+    # Create training arguments
+    training_args = create_training_args(
+        output_dir=output_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size_eval,
+        learning_rate=learning_rate,
+    )
 
-    logger.info(f"cellpose train dataset loaded with {len(cellpose_train_dataset)} samples.")
-    if train:
-        # train_dataset = DistillationDatasetWrapper(processed_datasets=[sa1b_dataset], unprocessed_datasets=[cellpose_train_dataset, cellposen_train_dataset], dtype=dtype)
-        train_dataset = DistillationDatasetWrapperIndex(datasets=[sa1b_dataset, cellpose_train_dataset, cellposen_train_dataset])
-
-        logger.info(f"Train tiles: {len(train_dataset)}")
-
-
-        # Create training arguments
-        training_args = create_training_args(
-            output_dir=output_dir,
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            learning_rate=learning_rate,
-        )
-
-        # Create trainer
-        logger.info("Creating trainer...")
-        trainer = DistillationTrainer(
-            model=distillation_model,
-            args=training_args,
-            train_dataset=train_dataset,
-            loss_fn=nn.MSELoss(),
-        )
-
+    # Create trainer with evaluation capabilities
+    logger.info("Creating trainer...")
+    trainer = DistillationTrainer(
+        model=distillation_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss_fn=nn.MSELoss(),
+        student_decoder=student_decoder,
+        cellpose_model=cellpose_model,
+    )
+    if TRAINING_ARGS['train']:
         # Start training
         logger.info("Starting distillation training...")
         trainer.train()
-        student_encoder = distillation_model.student_encoder
-    else:
-        student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
+
+    student_encoder = distillation_model.student_encoder
 
     # Save the student encoder
     logger.info(f"Saving student encoder to {output_dir}/student_encoder.pt")
-    torch.save(student_encoder.state_dict(), f"{output_dir}/student_encoder.pt")
-
-    logger.info("Starting Evaluation..")
-    logger.info("Creating validation segmentation dataset...")
-    val_seg_dataset = ImageMaskDataset(root_dir=Path(CELLPOSE_DATASET_PATH, 'test'), dtype=dtype)
-    metrics = evaluate_on_masks(
-        student_encoder, student_decoder, val_seg_dataset, device=device, batch_size=batch_size_eval, teacher_model=teacher_model)
-    
-    np.savez(f"{output_dir}/segmentation_metrics.npz", **metrics)
-    mean_ap = metrics["ap"].mean()
-    logger.info(f"Segmentation eval: {mean_ap}")
-
+    torch.save(distillation_model.student_encoder.state_dict(), f"{output_dir}/student_encoder.pt")
     logger.info("Training completed!")
+
+    cellpose_model.net = StudentSegmentationModel(DistillationModel.encoder, student_decoder).to(device)
+    logger.info("Starting Evaluation using trainer.evaluate()...")
+    eval_metrics = trainer.evaluate()
+    
+    # Save metrics to file
+    np.savez(f"{output_dir}/segmentation_metrics.npz", **eval_metrics)
+    logger.info(f"Segmentation eval mean AP: {eval_metrics['eval_mean_ap']:.4f}")
+
 
 
 if __name__ == "__main__":
