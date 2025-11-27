@@ -1309,6 +1309,46 @@ class MainW(QMainWindow):
             # [0,0,0,self.opacity])
         self.update_layer()
 
+    def remove_cell_from_current_z(self, idx):
+        """Remove a cell mask only from the current Z-plane (3D mode)."""
+        # Save state before removal for undo
+        self.save_mask_state()
+        
+        z = self.currentZ
+        cp = self.cellpix[z] == idx
+        op = self.outpix[z] == idx
+        
+        # Check if this cell exists on this plane
+        if not cp.any():
+            print(f"GUI_INFO: cell {idx} not found on Z-plane {z}")
+            return
+        
+        # Remove from current Z-plane only
+        self.cellpix[z, cp] = 0
+        self.outpix[z, op] = 0
+        self.layerz[cp] = np.array([0, 0, 0, 0])
+        
+        # Check if this cell still exists on any other Z-plane
+        cell_exists_elsewhere = (self.cellpix == idx).any()
+        
+        if not cell_exists_elsewhere:
+            # If cell no longer exists anywhere, remove it completely and reindex
+            self.cellpix[self.cellpix > idx] -= 1
+            self.outpix[self.outpix > idx] -= 1
+            self.ismanual = np.delete(self.ismanual, idx - 1)
+            self.cellcolors = np.delete(self.cellcolors, [idx], axis=0)
+            del self.zdraw[idx - 1]
+            self.ncells -= 1
+            print(f"GUI_INFO: removed cell {idx} completely (was only on Z={z})")
+        else:
+            print(f"GUI_INFO: removed cell {idx} from Z-plane {z} (still exists on other planes)")
+        
+        self.update_layer()
+        if self.ncells == 0:
+            self.ClearButton.setEnabled(False)
+        if self.NZ == 1:
+            io._save_sets_with_check(self)
+
     def remove_cell(self, idx):
         if isinstance(idx, (int, np.integer)):
             idx = [idx]
@@ -1916,11 +1956,16 @@ class MainW(QMainWindow):
         if self.roisOn:
             # self.layerz[self.text_overlay[..., -1] > 0] = self.text_overlay[self.text_overlay[..., -1] > 0]
             # z is the current slice index you’re displaying
-            ov = self.text_overlay[self.currentZ]                 # (Ly, Lx, 4)
-            mask = ov[..., 3] > 0                     # (Ly, Lx) – alpha>0
-            mask4 = mask[..., None]                   # (Ly, Lx, 1) for channel-wise broadcast
-            # Replace only where text exists
-            self.layerz = np.where(mask4, ov, self.layerz)   # both (Ly, Lx, 4), dtype uint8
+            # Ensure text_overlay has correct size for current Z-stack
+            if self.currentZ < self.text_overlay.shape[0]:
+                ov = self.text_overlay[self.currentZ]                 # (Ly, Lx, 4)
+                mask = ov[..., 3] > 0                     # (Ly, Lx) – alpha>0
+                mask4 = mask[..., None]                   # (Ly, Lx, 1) for channel-wise broadcast
+                # Replace only where text exists
+                self.layerz = np.where(mask4, ov, self.layerz)   # both (Ly, Lx, 4), dtype uint8
+            elif self.text_overlay.shape[0] != self.NZ:
+                # Resize text_overlay if NZ changed
+                self.text_overlay = np.zeros((self.NZ, self.Ly, self.Lx, 4), np.uint8)
 
 
     def set_normalize_params(self, normalize_params):
