@@ -208,6 +208,9 @@ class MainW_3d(MainW):
         self.l0.addWidget(self.orthobtn, b, 0, 1, 2)
         self.orthobtn.toggled.connect(self.toggle_ortho)
 
+        # Add view plane state (0=XY, 1=ZX, 2=ZY)
+        self.view_plane = 0
+
         label = QLabel("dz:")
         label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         label.setFont(self.medfont)
@@ -247,6 +250,15 @@ class MainW_3d(MainW):
         self.zpos.setFixedWidth(40)
         self.zpos.setFont(self.medfont)
         self.l0.addWidget(self.zpos, b, 7, 1, 2)
+
+        b += 1
+        # Add view plane toggle button
+        from qtpy.QtWidgets import QPushButton
+        self.view_plane_btn = QPushButton("XY")
+        self.view_plane_btn.setToolTip("Toggle view plane: XY -> ZX -> ZY")
+        self.view_plane_btn.setFont(self.medfont)
+        self.view_plane_btn.clicked.connect(self.toggle_view_plane)
+        self.l0.addWidget(self.view_plane_btn, b, 0, 1, 2)
 
         # if called with image, load it
         if image is not None:
@@ -341,9 +353,70 @@ class MainW_3d(MainW):
 
         return median
 
+    def draw_layer(self):
+        """Override draw_layer to handle different view planes"""
+        if self.view_plane == 0:  # XY view (original behavior)
+            super().draw_layer()
+        else:
+            # Handle ZX and ZY views
+            if self.resize:
+                self.Ly, self.Lx = self.Lyr, self.Lxr
+            else:
+                self.Ly, self.Lx = self.Ly0, self.Lx0
+
+            if self.view_plane == 1:  # ZX view
+                layer_shape = (self.NZ, self.Lx)
+            else:  # ZY view
+                layer_shape = (self.NZ, self.Ly)
+
+            self.layerz = np.zeros((*layer_shape, 4), np.uint8)
+            
+            if self.masksOn:
+                if self.view_plane == 1:  # ZX view
+                    cellpix_slice = self.cellpix[:, self.currentZ, :]
+                else:  # ZY view
+                    cellpix_slice = self.cellpix[:, :, self.currentZ]
+                
+                self.layerz[..., :3] = self.cellcolors[cellpix_slice, :]
+                self.layerz[..., 3] = self.opacity * (cellpix_slice > 0).astype(np.uint8)
+                
+                if self.selected > 0:
+                    self.layerz[cellpix_slice == self.selected] = np.array(
+                        [255, 255, 255, self.opacity])
+            else:
+                self.layerz[..., 3] = 0
+
+            if self.outlinesOn:
+                if self.view_plane == 1:  # ZX view
+                    outpix_slice = self.outpix[:, self.currentZ, :]
+                else:  # ZY view
+                    outpix_slice = self.outpix[:, :, self.currentZ]
+                self.layerz[outpix_slice > 0] = np.array(self.outcolor).astype(np.uint8)
+
+            # Handle text overlay for side views
+            if self.roisOn and hasattr(self, 'text_overlay'):
+                if self.view_plane == 1:  # ZX view
+                    # Extract text overlay for the current Y slice
+                    ov = self.text_overlay[:, self.currentZ, :, :]  # Shape: (NZ, Lx, 4)
+                elif self.view_plane == 2:  # ZY view
+                    # Extract text overlay for the current X slice
+                    ov = self.text_overlay[:, :, self.currentZ, :]  # Shape: (NZ, Ly, 4)
+                
+                mask = ov[..., 3] > 0
+                mask4 = mask[..., None]
+                self.layerz = np.where(mask4, ov, self.layerz)
+
     def move_in_Z(self):
         if self.loaded:
-            self.currentZ = min(self.NZ, max(0, int(self.scroll.value())))
+            # Set appropriate maximum based on view plane
+            if self.view_plane == 0:  # XY view
+                max_val = self.NZ
+            elif self.view_plane == 1:  # ZX view (scrolling through Y)
+                max_val = self.Ly
+            else:  # ZY view (scrolling through X)
+                max_val = self.Lx
+            
+            self.currentZ = min(max_val - 1, max(0, int(self.scroll.value())))
             self.zpos.setText(str(self.currentZ))
             self.update_plot()
             self.draw_layer()
@@ -541,6 +614,173 @@ class MainW_3d(MainW):
         else:
             self.remove_orthoviews()
 
+    # Override selection methods to handle side-view planes (XY/ZX/ZY)
+    def _current_plane_masks(self, idx):
+        """Return (cp_mask, op_mask) boolean arrays aligned with current layerz for idx."""
+        if self.view_plane == 0:  # XY
+            z = self.currentZ
+            cp = (self.cellpix[z] == idx)
+            op = (self.outpix[z] == idx)
+        elif self.view_plane == 1:  # ZX (Y fixed)
+            y = self.currentZ
+            cp = (self.cellpix[:, y, :] == idx)
+            op = (self.outpix[:, y, :] == idx)
+        else:  # ZY (X fixed)
+            x = self.currentZ
+            cp = (self.cellpix[:, :, x] == idx)
+            op = (self.outpix[:, :, x] == idx)
+        return cp, op
+
+    def select_cell(self, idx):
+        self.prev_selected = self.selected
+        self.selected = idx
+        if self.selected > 0:
+            cp, _ = self._current_plane_masks(idx)
+            # Guard against shape mismatches
+            if cp.shape[:2] == self.layerz.shape[:2]:
+                self.layerz[cp] = np.array([255, 255, 255, self.opacity], dtype=np.uint8)
+                self.update_layer()
+
+    def select_cell_multi(self, idx):
+        if idx > 0:
+            cp, _ = self._current_plane_masks(idx)
+            if cp.shape[:2] == self.layerz.shape[:2]:
+                self.layerz[cp] = np.array([255, 255, 255, self.opacity], dtype=np.uint8)
+                self.update_layer()
+
+    def unselect_cell(self):
+        if self.selected > 0:
+            idx = self.selected
+            if idx < (self.ncells.get() + 1):
+                cp, op = self._current_plane_masks(idx)
+                if cp.shape[:2] == self.layerz.shape[:2]:
+                    base_col = np.append(self.cellcolors[idx], self.opacity).astype(np.uint8)
+                    self.layerz[cp] = base_col
+                    if self.outlinesOn:
+                        self.layerz[op] = np.array(self.outcolor, dtype=np.uint8)
+                    self.update_layer()
+        self.selected = 0
+
+    def unselect_cell_multi(self, idx):
+        cp, op = self._current_plane_masks(idx)
+        if cp.shape[:2] == self.layerz.shape[:2]:
+            base_col = np.append(self.cellcolors[idx], self.opacity).astype(np.uint8)
+            self.layerz[cp] = base_col
+            if self.outlinesOn:
+                self.layerz[op] = np.array(self.outcolor, dtype=np.uint8)
+            self.update_layer()
+
+    def select_and_zoom(self, roi_id):
+        """Select an ROI by id and zoom, respecting current view plane (XY/ZX/ZY)."""
+        try:
+            if roi_id <= 0 or roi_id > self.ncells.get():
+                print(f"GUI_ERROR: ROI ID {roi_id} out of range (1-{self.ncells.get()})")
+                self.roi_id_input.setStyleSheet("border: 1px solid red;")
+                return
+
+            # Find first Z-plane containing ROI
+            first_z = None
+            for z in range(self.NZ):
+                if (z, roi_id) in self.cellcenters:
+                    first_z = z
+                    break
+
+            # Default center coords (cy, cx) from centroid at currentZ or first_z
+            cy, cx = None, None
+            target_z = self.currentZ if first_z is None else first_z
+            if (target_z, roi_id) in self.cellcenters:
+                cy, cx = self.cellcenters[(target_z, roi_id)]
+
+            # Update slicing index and scroll based on plane
+            if self.view_plane == 0:  # XY: scroll to the Z where ROI exists
+                if first_z is not None:
+                    self.currentZ = first_z
+                    if self.NZ > 1:
+                        self.scroll.setValue(self.currentZ)
+                        self.zpos.setText(str(self.currentZ))
+                self.update_plot()
+                self.draw_layer()
+            elif self.view_plane == 1:  # ZX: scroll index is Y
+                if cy is None and first_z is not None and (first_z, roi_id) in self.cellcenters:
+                    cy, cx = self.cellcenters[(first_z, roi_id)]
+                if cy is not None:
+                    self.currentZ = int(np.clip(round(cy), 0, self.Ly - 1))
+                    self.scroll.setMaximum(self.Ly - 1)
+                    self.scroll.setValue(self.currentZ)
+                    self.zpos.setText(str(self.currentZ))
+                self.update_plot()
+                self.draw_layer()
+            else:  # ZY: scroll index is X
+                if cy is None and first_z is not None and (first_z, roi_id) in self.cellcenters:
+                    cy, cx = self.cellcenters[(first_z, roi_id)]
+                if cx is not None:
+                    self.currentZ = int(np.clip(round(cx), 0, self.Lx - 1))
+                    self.scroll.setMaximum(self.Lx - 1)
+                    self.scroll.setValue(self.currentZ)
+                    self.zpos.setText(str(self.currentZ))
+                self.update_plot()
+                self.draw_layer()
+
+            # Update selection highlight
+            self.unselect_cell()
+            self.select_cell(roi_id)
+            self.update_layer()
+
+            # Zoom viewbox around ROI centroid projected into current plane
+            if (first_z is not None) and (cy is not None) and (cx is not None):
+                zoom_size = 150
+                if self.view_plane == 0:  # XY: center at (cy,cx)
+                    x_min = max(0, cx - zoom_size)
+                    x_max = min(self.Lx, cx + zoom_size)
+                    y_min = max(0, cy - zoom_size)
+                    y_max = min(self.Ly, cy + zoom_size)
+                elif self.view_plane == 1:  # ZX: x=cx (0..Lx), y=z (0..NZ)
+                    x_min = max(0, cx - zoom_size)
+                    x_max = min(self.Lx, cx + zoom_size)
+                    y_min = max(0, first_z - zoom_size)
+                    y_max = min(self.NZ, first_z + zoom_size)
+                else:  # ZY: x=cy (0..Ly), y=z (0..NZ)
+                    x_min = max(0, cy - zoom_size)
+                    x_max = min(self.Ly, cy + zoom_size)
+                    y_min = max(0, first_z - zoom_size)
+                    y_max = min(self.NZ, first_z + zoom_size)
+
+                self.p0.setXRange(x_min, x_max, padding=0)
+                self.p0.setYRange(y_min, y_max, padding=0)
+
+                plane = ["XY", "ZX", "ZY"][self.view_plane]
+                print(f"GUI_INFO: selected and zoomed to ROI {roi_id} at Z={first_z} (cy={cy:.1f}, cx={cx:.1f}) in {plane} view")
+            else:
+                print(f"GUI_INFO: selected ROI {roi_id}")
+        except Exception as e:
+            print(f"GUI_ERROR: select_and_zoom failed for ROI {roi_id}: {e}")
+
+    def toggle_view_plane(self):
+        """Toggle between XY, ZX, and ZY view planes"""
+        if self.loaded:
+            self.view_plane = (self.view_plane + 1) % 3
+            plane_names = ["XY", "ZX", "ZY"]
+            self.view_plane_btn.setText(plane_names[self.view_plane])
+            
+            # Reset scroll position to 0 when changing planes
+            self.currentZ = 0
+            self.scroll.setValue(0)
+            self.zpos.setText(str(self.currentZ))
+            
+            # Update scroll bar maximum based on new plane
+            if self.view_plane == 0:  # XY view
+                self.scroll.setMaximum(self.NZ - 1)
+            elif self.view_plane == 1:  # ZX view
+                self.scroll.setMaximum(self.Ly - 1)
+            else:  # ZY view
+                self.scroll.setMaximum(self.Lx - 1)
+            
+            self.update_plot()
+            self.draw_layer()
+            self.update_layer()
+            if self.orthobtn.isChecked():
+                self.update_ortho()
+
     def plot_clicked(self, event):
         if event.button()==QtCore.Qt.LeftButton \
                 and not event.modifiers() & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier)\
@@ -565,7 +805,86 @@ class MainW_3d(MainW):
                                 self.update_ortho()
 
     def update_plot(self):
-        super().update_plot()
+        # Handle different view planes
+        if self.view_plane == 0:  # XY view (original behavior)
+            super().update_plot()
+        else:
+            # For ZX and ZY views, we need to extract the appropriate slice
+            self.view = self.ViewDropDown.currentIndex()
+            
+            if self.view_plane == 1:  # ZX view (viewing from Y axis)
+                # Get slice at Y position (currentZ now refers to Y coordinate)
+                if self.view == 0:  # image view
+                    image = self.stack[:, self.currentZ, :].copy()  # Shape: (NZ, Lx, nchan)
+                elif self.view == 4:  # filtered view
+                    image = self.stack_filtered[:, self.currentZ, :].copy()
+                else:
+                    # For flow views
+                    image = np.zeros((self.NZ, self.Lx), np.uint8)
+                    if len(self.flows) >= self.view - 1 and len(self.flows[self.view - 1]) > 0:
+                        image = self.flows[self.view - 1][:, self.currentZ, :]
+                self.Ly, self.Lx = self.NZ, self.stack.shape[2]
+            else:  # ZY view (viewing from X axis)
+                # Get slice at X position (currentZ now refers to X coordinate)
+                if self.view == 0:  # image view
+                    image = self.stack[:, :, self.currentZ].copy()  # Shape: (NZ, Ly, nchan)
+                elif self.view == 4:  # filtered view
+                    image = self.stack_filtered[:, :, self.currentZ].copy()
+                else:
+                    # For flow views
+                    image = np.zeros((self.NZ, self.stack.shape[1]), np.uint8)
+                    if len(self.flows) >= self.view - 1 and len(self.flows[self.view - 1]) > 0:
+                        image = self.flows[self.view - 1][:, :, self.currentZ]
+                self.Ly, self.Lx = self.NZ, self.stack.shape[1]
+            
+            # Display the image based on color settings
+            if self.view == 0 or self.view == 4:
+                if self.color == 0:  # RGB
+                    self.img.setImage(image, autoLevels=False, lut=None)
+                    if self.nchan > 1:
+                        # saturation is a list of lists: saturation[channel][z] = [min, max]
+                        sat_array_0 = np.array(self.saturation[0])  # Shape: (NZ, 2)
+                        sat_array_1 = np.array(self.saturation[1])
+                        sat_array_2 = np.array(self.saturation[2])
+                        levels = np.array([
+                            [sat_array_0[:, 0].mean(), sat_array_0[:, 1].mean()],
+                            [sat_array_1[:, 0].mean(), sat_array_1[:, 1].mean()],
+                            [sat_array_2[:, 0].mean(), sat_array_2[:, 1].mean()]
+                        ])
+                        self.img.setLevels(levels)
+                    else:
+                        sat_array = np.array(self.saturation[0])
+                        self.img.setLevels([sat_array[:, 0].mean(), sat_array[:, 1].mean()])
+                elif self.color > 0 and self.color < 4:  # Single channel
+                    if self.nchan > 1:
+                        image = image[:, :, self.color - 1]
+                    self.img.setImage(image, autoLevels=False, lut=self.cmap[self.color])
+                    if self.nchan > 1:
+                        sat_array = np.array(self.saturation[self.color - 1])
+                        self.img.setLevels([sat_array[:, 0].mean(), sat_array[:, 1].mean()])
+                    else:
+                        sat_array = np.array(self.saturation[0])
+                        self.img.setLevels([sat_array[:, 0].mean(), sat_array[:, 1].mean()])
+                elif self.color == 4:  # Gray
+                    if image.ndim > 2:
+                        image = image.mean(axis=-1)
+                    self.img.setImage(image, autoLevels=False, lut=None)
+                    sat_array = np.array(self.saturation[0])
+                    self.img.setLevels([sat_array[:, 0].mean(), sat_array[:, 1].mean()])
+                elif self.color == 5:  # Gray (with colormap)
+                    if image.ndim > 2:
+                        image = image.mean(axis=-1)
+                    self.img.setImage(image, autoLevels=False, lut=self.cmap[0])
+                    sat_array = np.array(self.saturation[0])
+                    self.img.setLevels([sat_array[:, 0].mean(), sat_array[:, 1].mean()])
+            else:
+                # Flow views
+                if self.view > 1:
+                    self.img.setImage(image, autoLevels=False, lut=self.bwr)
+                else:
+                    self.img.setImage(image, autoLevels=False, lut=None)
+                self.img.setLevels([0.0, 255.0])
+
         if self.NZ > 1 and self.orthobtn.isChecked():
             self.update_ortho()
         self.win.show()
@@ -582,11 +901,25 @@ class MainW_3d(MainW):
                         self.add_set()
                     if self.NZ > 1:
                         if event.key() == QtCore.Qt.Key_Left:
+                            # Determine max based on view plane
+                            if self.view_plane == 0:  # XY view
+                                max_val = self.NZ - 1
+                            elif self.view_plane == 1:  # ZX view
+                                max_val = self.Ly - 1
+                            else:  # ZY view
+                                max_val = self.Lx - 1
                             self.currentZ = max(0, self.currentZ - 1)
                             self.scroll.setValue(self.currentZ)
                             updated = True
                         elif event.key() == QtCore.Qt.Key_Right:
-                            self.currentZ = min(self.NZ - 1, self.currentZ + 1)
+                            # Determine max based on view plane
+                            if self.view_plane == 0:  # XY view
+                                max_val = self.NZ - 1
+                            elif self.view_plane == 1:  # ZX view
+                                max_val = self.Ly - 1
+                            else:  # ZY view
+                                max_val = self.Lx - 1
+                            self.currentZ = min(max_val, self.currentZ + 1)
                             self.scroll.setValue(self.currentZ)
                             updated = True
                 else:
@@ -600,12 +933,26 @@ class MainW_3d(MainW):
                         self.OCheckBox.toggle()
                     if event.key() == QtCore.Qt.Key_Left or event.key(
                     ) == QtCore.Qt.Key_A:
+                        # Determine max based on view plane
+                        if self.view_plane == 0:  # XY view
+                            max_val = self.NZ - 1
+                        elif self.view_plane == 1:  # ZX view
+                            max_val = self.Ly - 1
+                        else:  # ZY view
+                            max_val = self.Lx - 1
                         self.currentZ = max(0, self.currentZ - 1)
                         self.scroll.setValue(self.currentZ)
                         updated = True
                     elif event.key() == QtCore.Qt.Key_Right or event.key(
                     ) == QtCore.Qt.Key_D:
-                        self.currentZ = min(self.NZ - 1, self.currentZ + 1)
+                        # Determine max based on view plane
+                        if self.view_plane == 0:  # XY view
+                            max_val = self.NZ - 1
+                        elif self.view_plane == 1:  # ZX view
+                            max_val = self.Ly - 1
+                        else:  # ZY view
+                            max_val = self.Lx - 1
+                        self.currentZ = min(max_val, self.currentZ + 1)
                         self.scroll.setValue(self.currentZ)
                         updated = True
                     elif event.key() == QtCore.Qt.Key_PageDown:
@@ -662,6 +1009,15 @@ class MainW_3d(MainW):
             zpos = int(self.zpos.text())
         except:
             print("ERROR: zposition is not a number")
-        self.currentZ = max(0, min(self.NZ - 1, zpos))
+        
+        # Determine max based on view plane
+        if self.view_plane == 0:  # XY view
+            max_val = self.NZ - 1
+        elif self.view_plane == 1:  # ZX view
+            max_val = self.Ly - 1
+        else:  # ZY view
+            max_val = self.Lx - 1
+        
+        self.currentZ = max(0, min(max_val, zpos))
         self.zpos.setText(str(self.currentZ))
         self.scroll.setValue(self.currentZ)
