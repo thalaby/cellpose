@@ -1524,7 +1524,7 @@ class MainW(QMainWindow):
             self.layerz[stroke[~outpix, 1], stroke[~outpix, 2]] = np.array([0, 0, 0, 0])
             cellpix = self.cellpix[cZ, stroke[:, 1], stroke[:, 2]]
             ccol = self.cellcolors.copy()
-            if self.selected > 0:
+            if self.selected > 0 and self.selected < len(ccol):
                 ccol[self.selected] = np.array([255, 255, 255])
             col2mask = ccol[cellpix]
             if self.masksOn:
@@ -1931,10 +1931,12 @@ class MainW(QMainWindow):
 
         self.layerz = np.zeros((self.Ly, self.Lx, 4), np.uint8)
         if self.masksOn:
-            self.layerz[..., :3] = self.cellcolors[self.cellpix[self.currentZ], :]
+            # Clamp cellpix values to valid cellcolors range to prevent IndexError
+            current_cellpix = np.clip(self.cellpix[self.currentZ], 0, len(self.cellcolors) - 1)
+            self.layerz[..., :3] = self.cellcolors[current_cellpix, :]
             self.layerz[..., 3] = self.opacity * (self.cellpix[self.currentZ]
                                                   > 0).astype(np.uint8)
-            if self.selected > 0:
+            if self.selected > 0 and self.selected < len(self.cellcolors):
                 self.layerz[self.cellpix[self.currentZ] == self.selected] = np.array(
                     [255, 255, 255, self.opacity])
             cZ = self.currentZ

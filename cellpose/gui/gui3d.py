@@ -299,8 +299,15 @@ class MainW_3d(MainW):
                     # get dense outline
                     contours = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                                 cv2.CHAIN_APPROX_NONE)
-                    pvc, pvr = contours[-2][0].squeeze().T
+                    contour_pts = contours[-2][0].squeeze()
+                    if contour_pts.ndim == 1:
+                        # Single point case - ensure 2D shape
+                        contour_pts = contour_pts.reshape(1, -1)
+                    pvc, pvr = contour_pts.T
                     vr, vc = pvr + vr.min() - 2, pvc + vc.min() - 2
+                    # Ensure vr and vc are at least 1D arrays
+                    vr = np.atleast_1d(vr)
+                    vc = np.atleast_1d(vc)
                     # concatenate all points
                     ar, ac = np.hstack((np.vstack((vr, vc)), np.vstack((ar, ac))))
                     # if these pixels are overlapping with another cell, reassign them
@@ -315,8 +322,15 @@ class MainW_3d(MainW):
                         mask[ar - ar.min() + 2, ac - ac.min() + 2] = 1
                         contours = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                                     cv2.CHAIN_APPROX_NONE)
-                        pvc, pvr = contours[-2][0].squeeze().T
+                        contour_pts = contours[-2][0].squeeze()
+                        if contour_pts.ndim == 1:
+                            # Single point case - ensure 2D shape
+                            contour_pts = contour_pts.reshape(1, -1)
+                        pvc, pvr = contour_pts.T
                         vr, vc = pvr + ar.min() - 2, pvc + ac.min() - 2
+                        # Ensure vr and vc are at least 1D arrays
+                        vr = np.atleast_1d(vr)
+                        vc = np.atleast_1d(vc)
                     ars = np.concatenate((ars, ar), axis=0)
                     acs = np.concatenate((acs, ac), axis=0)
                     vrs = np.concatenate((vrs, vr), axis=0)
