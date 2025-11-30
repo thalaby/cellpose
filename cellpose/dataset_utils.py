@@ -3,6 +3,7 @@ from settings import (
     TEST_DATASET_PATHS,
     SA1B_TRAIN_DATASET_PATH,
     TRAINING_ARGS,
+    CELL_EVAL_DATASET_PATHS,
 )
 import os
 import re
@@ -31,12 +32,13 @@ class ImageMaskDataset(Dataset):
         img_suffix="_img",
         mask_suffix="_masks",
         dtype=torch.float32,
+        name=None,
     ):
         self.root_dir = root_dir
         self.img_suffix = img_suffix
         self.mask_suffix = mask_suffix
         self.dtype = dtype
-
+        self.name = name
         # Supported image extensions (lowercase)
         self.img_extensions = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
 
@@ -110,7 +112,7 @@ class ImageMaskDataset(Dataset):
 
         mask = mask.to(self.dtype)
 
-        return img, mask
+        return {'pixel_values': img, 'labels': mask}
     
 
 def _tile_512_to_256(x):
@@ -126,6 +128,8 @@ def _tile_512_to_256(x):
         added_channel = True
 
     N, H, W, C = x.shape
+    if H == 256 and W == 256:
+        return x
     assert H == 512 and W == 512, f"Expected 512x512, got {x.shape}"
 
     # (N, 512, 512, C) → split into quadrants
@@ -164,7 +168,7 @@ class NPZImageMaskDataset(Dataset):
     def __init__(self, npz_path, dtype=torch.float32, name=None, bsize=256):
         self.npz_path = Path(npz_path)
         self.dtype = dtype
-        self.name = name if name is not None else self.npz_path.stem
+        self.name = name
 
         if not self.npz_path.exists():
             raise FileNotFoundError(f"NPZ file not found: {npz_path}")
@@ -396,7 +400,9 @@ class TiledImageDirDataset(Dataset):
             tile = padded
 
         img_tensor = self._image_array_to_tensor(tile)
-        return {"pixel_values": img_tensor}
+        # Add dummy labels for compatibility with data collators expecting labels
+        dummy_labels = torch.zeros((1, tile_size, tile_size), dtype=self.dtype)
+        return {"pixel_values": img_tensor, "labels": dummy_labels}
 
 
 class DistillationDatasetWrapperIndex(Dataset):
@@ -476,12 +482,12 @@ class CombinedImageMaskDataset(Dataset):
         self.datasets = []
         self.offsets = [0]
 
-        for path in dataset_paths:
+        for name, path in dataset_paths:
             if str(path).endswith(".npz"):
-                ds = NPZImageMaskDataset(path, dtype=dtype)
+                ds = NPZImageMaskDataset(path, dtype=dtype, name=name)
             else:
                 ds = ImageMaskDataset(
-                    path, img_suffix=img_suffix, mask_suffix=mask_suffix, dtype=dtype
+                    path, img_suffix=img_suffix, mask_suffix=mask_suffix, dtype=dtype, name=name
                 )
             self.datasets.append(ds)
             self.offsets.append(self.offsets[-1] + len(ds))
@@ -505,22 +511,49 @@ class CombinedImageMaskDataset(Dataset):
         raise IndexError(f"Index {idx} out of range")
 
 
-def get_train_dataset():
-    datasets = []
+def get_train_val_dataset():
+    train_datasets = []
+    val_datasets = []
     paths = (
         CELL_TRAIN_DATASET_PATHS
         if TRAINING_ARGS.get("train_on_cellular", True)
         else SA1B_TRAIN_DATASET_PATH
-    )
+)   
     for path in paths:
+        val_ds = None
         if str(path).endswith(".npz"):
-            ds = NPZImageMaskDataset(path, dtype=torch.float32)
+            train_ds = NPZImageMaskDataset(path, dtype=torch.float32)
         else:
             ds = TiledImageDirDataset(root_dir=path, dtype=torch.float32)
-        datasets.append(ds)
-    combined_dataset = DistillationDatasetWrapperIndex(datasets=datasets)
-    return combined_dataset
+            # Split dataset into 90% train and 10% validation
+            train_size = int(0.9 * len(ds))
+            val_size = len(ds) - train_size
+            train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
+        train_datasets.append(train_ds)
+        if val_ds is not None:
+            val_datasets.append(val_ds)
+    combined_train_dataset = DistillationDatasetWrapperIndex(datasets=train_datasets)
+    val_datasets.extend(get_val_dataset())
+    combined_val_dataset = DistillationDatasetWrapperIndex(datasets=val_datasets)
+    return combined_train_dataset, combined_val_dataset
 
 
 def get_test_dataset():
-    return CombinedImageMaskDataset(TEST_DATASET_PATHS, dtype=torch.float32)
+    datasets = {}
+    for name, path in TEST_DATASET_PATHS:
+        if str(path).endswith(".npz"):
+            ds = NPZImageMaskDataset(path, dtype=torch.float32, name=name)
+        else:
+            ds = ImageMaskDataset(
+                path, dtype=torch.float32, name=name
+            )
+        datasets[name] = ds
+    return datasets
+
+def get_val_dataset():
+    datasets = []
+    for path in CELL_EVAL_DATASET_PATHS:
+        assert str(path).endswith(".npz")
+        ds = NPZImageMaskDataset(path, dtype=torch.float32)
+        datasets.append(ds)
+    return datasets

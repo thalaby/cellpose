@@ -1,6 +1,6 @@
 from vit_sam import Transformer
 from vit_tiny import SAMStyleTinyViTEncoder, SAMStyleTinyViTDecoder
-from dataset_utils import get_train_dataset, get_test_dataset
+from dataset_utils import get_train_val_dataset, get_test_dataset
 from settings import MODEL_PATH, TRAINING_ARGS
 
 from train_utils import (
@@ -17,7 +17,7 @@ from logging import getLogger
 import torch
 import logging
 import numpy as np
-# import wandb
+import wandb
 
 # Configure logging to print to stdout
 logging.basicConfig(
@@ -55,10 +55,10 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
     default_args = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
-        "num_train_epochs": 3,
-        "per_device_train_batch_size": 2,
-        "per_device_eval_batch_size": 1,
-        "learning_rate": 1e-4,
+        "num_train_epochs": 4,
+        "per_device_train_batch_size": 64,
+        "per_device_eval_batch_size": 64,
+        "learning_rate": 5e-4,
         "warmup_steps": 500,
         "weight_decay": 0.01,
         "logging_dir": "./logs",
@@ -69,8 +69,10 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "fp16": False,  # Disable FP16 since models are already float16
         "gradient_accumulation_steps": 1,
         "remove_unused_columns": False,
-        "report_to": "none",
+        "report_to": "wandb",
         "dataloader_num_workers": 8,
+        "eval_strategy": "epoch",  # Run validation after every epoch
+        "save_strategy": "epoch",  # Save checkpoint after every epoch
     }
     default_args.update(kwargs)
     return TrainingArguments(**default_args)
@@ -81,7 +83,6 @@ def main(
     num_epochs=3,
     batch_size=TRAINING_ARGS["train_batch_size"],
     learning_rate=1e-4,
-    batch_size_eval=1,
 ):
     """Main training function"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,16 +107,17 @@ def main(
 
     # Load dataset
     
-    # wandb.init(project="cellpose_distillation", name="distillation_run")
+    wandb.init(project="cellpose_distillation", name="distillation_run")
     
-    # Create evaluation dataset from multiple paths
-    logger.info("Creating evaluation dataset...")
-    eval_dataset = get_test_dataset()
-    logger.info(f"Eval tiles: {len(eval_dataset)}")
+    # Create test dataset from multiple paths
+    logger.info("Creating test dataset...")
+    test_dataset = get_test_dataset()
+    # logger.info(f"test tiles: {len(test_dataset)}")
 
     logger.info("Creating training dataset...")
-    train_dataset = get_train_dataset()
-    logger.info(f"Train tiles: {len(train_dataset)}")
+    train_dataset, eval_dataset = get_train_val_dataset()
+    logger.info(f"Train tiles: {len(train_dataset)}, Eval tiles: {len(eval_dataset)}")
+    
     
     # Create cellpose model for evaluation
     cellpose_model = create_cellpose_model(student_encoder, student_decoder, device=device)
@@ -124,8 +126,6 @@ def main(
     training_args = create_training_args(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size_eval,
         learning_rate=learning_rate,
     )
 
@@ -139,6 +139,7 @@ def main(
         loss_fn=nn.MSELoss(),
         student_decoder=student_decoder,
         cellpose_model=cellpose_model,
+        eval_log_steps=TRAINING_ARGS.get('eval_log_steps', None),  # Log eval metrics every N steps
     )
     if TRAINING_ARGS['train']:
         # Start training
@@ -152,13 +153,16 @@ def main(
     torch.save(distillation_model.student_encoder.state_dict(), f"{output_dir}/student_encoder.pt")
     logger.info("Training completed!")
 
-    cellpose_model.net = StudentSegmentationModel(DistillationModel.encoder, student_decoder).to(device)
-    logger.info("Starting Evaluation using trainer.evaluate()...")
-    eval_metrics = trainer.evaluate()
+    # Update cellpose model with trained student encoder
+    cellpose_model.net = StudentSegmentationModel(distillation_model.student_encoder, student_decoder).to(device)
+    
+    # Run final test with segmentation metrics
+    logger.info("Starting Test with segmentation metrics on test dataset...")
+    test_metrics = trainer.test(test_dataset=test_dataset)
     
     # Save metrics to file
-    np.savez(f"{output_dir}/segmentation_metrics.npz", **eval_metrics)
-    logger.info(f"Segmentation eval mean AP: {eval_metrics['eval_mean_ap']:.4f}")
+    np.savez(f"{output_dir}/segmentation_metrics.npz", **test_metrics)
+    logger.info(f"Segmentation test mean AP: {test_metrics['test_mean_ap']:.4f}")
 
 
 
