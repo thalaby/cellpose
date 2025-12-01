@@ -56,8 +56,8 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "output_dir": output_dir,
         "overwrite_output_dir": True,
         "num_train_epochs": 4,
-        "per_device_train_batch_size": 64,
-        "per_device_eval_batch_size": 64,
+        "per_device_train_batch_size": 128,
+        "per_device_eval_batch_size": 128,
         "learning_rate": 5e-4,
         "warmup_steps": 500,
         "weight_decay": 0.01,
@@ -80,9 +80,7 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
 
 def main(
     output_dir="./distillation_output",
-    num_epochs=3,
     batch_size=TRAINING_ARGS["train_batch_size"],
-    learning_rate=1e-4,
 ):
     """Main training function"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -125,8 +123,6 @@ def main(
     # Create training arguments
     training_args = create_training_args(
         output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        learning_rate=learning_rate,
     )
 
     # Create trainer with evaluation capabilities
