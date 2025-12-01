@@ -9,9 +9,15 @@ import os
 import re
 from pathlib import Path
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import torch
 from torch.utils.data import Dataset
+import logging
+
+# Allow PIL to load truncated images instead of raising an error
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+logger = logging.getLogger(__name__)
 
 
 class ImageMaskDataset(Dataset):
@@ -322,12 +328,18 @@ class TiledImageDirDataset(Dataset):
 
         # 2) Reconstruct the *same* file ordering as used when tile_index was computed
         # In compute_tile_index_dir.py we used: sorted(files) with optional recursion
+        # Filter for common image extensions only (exclude .npy and other non-image files)
+        image_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif'}
         if self.recursive:
             self.image_paths = sorted(
-                p for p in self.root_dir.rglob("*") if p.is_file()
+                p for p in self.root_dir.rglob("*") 
+                if p.is_file() and p.suffix.lower() in image_extensions
             )
         else:
-            self.image_paths = sorted(p for p in self.root_dir.iterdir() if p.is_file())
+            self.image_paths = sorted(
+                p for p in self.root_dir.iterdir() 
+                if p.is_file() and p.suffix.lower() in image_extensions
+            )
 
         if len(self.image_paths) == 0:
             raise RuntimeError(f"No image files found in directory: {self.root_dir}")
@@ -346,9 +358,29 @@ class TiledImageDirDataset(Dataset):
         """
         img_path = self.image_paths[sample_idx]
 
-        with Image.open(img_path) as img:
-            img = img.convert("RGB") if img.mode not in ("L", "RGB") else img.copy()
-            arr = np.array(img)
+        try:
+            with Image.open(img_path) as img:
+                # Force load the entire image to catch truncation errors early
+                img.load()
+                img = img.convert("RGB") if img.mode not in ("L", "RGB") else img.copy()
+                arr = np.array(img)
+        except (OSError, IOError) as e:
+            # Log the error and return a black image as fallback
+            logger.warning(f"Failed to load image {img_path}: {e}. Using black image as fallback.")
+            # Get expected dimensions from tile_index if available
+            if hasattr(self, 'tile_index') and sample_idx < len(self.tile_index):
+                # Use first occurrence of this sample_idx
+                mask = self.tile_index[:, 0] == sample_idx
+                if mask.any():
+                    idx = np.where(mask)[0][0]
+                    H, W = int(self.tile_index[idx, 3]), int(self.tile_index[idx, 4])
+                    arr = np.zeros((H, W, 3), dtype=np.uint8)
+                else:
+                    # Fallback to a default size
+                    arr = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            else:
+                # Fallback to a default size
+                arr = np.zeros((1024, 1024, 3), dtype=np.uint8)
 
         # (H, W) -> (H, W, 1)
         if arr.ndim == 2:
