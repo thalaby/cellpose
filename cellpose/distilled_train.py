@@ -71,7 +71,7 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "remove_unused_columns": False,
         "report_to": "wandb",
         "dataloader_num_workers": 8,
-        "eval_strategy": "epoch",  # Run validation after every epoch
+        # "eval_strategy": "epoch",  # Run validation after every epoch
         "save_strategy": "epoch",  # Save checkpoint after every epoch
     }
     default_args.update(kwargs)
@@ -161,6 +161,70 @@ def main(
     logger.info(f"Segmentation test mean AP: {test_metrics['test_mean_ap']:.4f}")
 
 
+def main_test():
+    """Main function for testing model loading and inference"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32
+
+    logger.info(f"Using device: {device}, dtype: {dtype}")
+    # Load encoders
+    logger.info("Loading student and teacher encoders...")
+    student_encoder, teacher_encoder, student_decoder, teacher_model = load_models(
+        device=device, dtype=dtype
+    )
+
+    # Create distillation model
+    logger.info("Creating distillation model...")
+    logger.info("Loading student encoder state dict from previous  training...")
+    # student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
+    distillation_model = DistillationModel(student_encoder, teacher_encoder)
+    distillation_model.to(device, dtype=dtype)
+    state_dict = load_file('distillation_output/checkpoint-6040/model.safetensors', device='cpu')
+    distillation_model.load_state_dict(state_dict)
+    distillation_model = distillation_model.to(device, dtype=dtype)
+
+    cellpose_model_mine = create_cellpose_model(distillation_model.student_encoder, student_decoder, device=device)
+    cellpose_model_orig = create_cellpose_model(teacher_encoder, student_decoder, device=device)
+    test_dataset = get_test_dataset()
+
+    # Create training arguments
+    training_args = create_training_args(
+        output_dir='test_output',
+    )
+    # Create trainer with evaluation capabilities
+    logger.info("Creating trainer...")
+    trainer_mine = DistillationTrainer(
+        model=distillation_model,
+        args=training_args,
+        train_dataset=None,
+        eval_dataset=None,
+        loss_fn=nn.MSELoss(),
+        student_decoder=student_decoder,
+        cellpose_model=cellpose_model_mine,
+        # eval_log_steps=TRAINING_ARGS.get('eval_log_steps', None),  # Log eval metrics every N steps
+    )
+
+    trainer_not_mine = DistillationTrainer(
+        model=distillation_model,
+        args=training_args,
+        train_dataset=None,
+        eval_dataset=None,
+        loss_fn=nn.MSELoss(),
+        student_decoder=student_decoder,
+        cellpose_model=cellpose_model_orig,
+        # eval_log_steps=TRAINING_ARGS.get('eval_log_steps', None),  # Log eval metrics every N steps
+    )
+
+    # Run final test with segmentation metrics
+    logger.info("Starting Test with segmentation metrics on test dataset...")
+    wandb.init(project="cellpose_distillation", name="distillation_test_run")
+    test_metrics_mine = trainer_mine.test(test_dataset=test_dataset)
+    test_metrics_not_mine = trainer_not_mine.test(test_dataset=test_dataset)
+    import ipdb; ipdb.set_trace()
+
+
+    
+
 
 if __name__ == "__main__":
-    main()
+    main_test()
