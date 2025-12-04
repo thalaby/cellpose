@@ -4,15 +4,16 @@ from settings import (
     SA1B_TRAIN_DATASET_PATH,
     TRAINING_ARGS,
     CELL_EVAL_DATASET_PATHS,
+    CELL_TRAIN_DATASET_PATHS_DECODER,
 )
 import os
-import re
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFile
 import torch
 from torch.utils.data import Dataset
 import logging
+from sa import SA1BDataset
 
 # Allow PIL to load truncated images instead of raising an error
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -89,12 +90,16 @@ class ImageMaskDataset(Dataset):
         img_path = next(
             os.path.join(self.root_dir, prefix + self.img_suffix + ext)
             for ext in self.img_extensions
-            if os.path.exists(os.path.join(self.root_dir, prefix + self.img_suffix + ext))
+            if os.path.exists(
+                os.path.join(self.root_dir, prefix + self.img_suffix + ext)
+            )
         )
         mask_path = next(
             os.path.join(self.root_dir, prefix + self.mask_suffix + ext)
             for ext in self.img_extensions
-            if os.path.exists(os.path.join(self.root_dir, prefix + self.mask_suffix + ext))
+            if os.path.exists(
+                os.path.join(self.root_dir, prefix + self.mask_suffix + ext)
+            )
         )
 
         # Load images
@@ -118,8 +123,8 @@ class ImageMaskDataset(Dataset):
 
         mask = mask.to(self.dtype)
 
-        return {'pixel_values': img, 'labels': mask}
-    
+        return {"pixel_values": img, "labels": mask}
+
 
 def _tile_512_to_256(x):
     """
@@ -130,7 +135,7 @@ def _tile_512_to_256(x):
     # Add channel dim if missing (for masks)
     added_channel = False
     if x.ndim == 3:
-        x = x[..., None]      # (N, 512, 512, 1)
+        x = x[..., None]  # (N, 512, 512, 1)
         added_channel = True
 
     N, H, W, C = x.shape
@@ -193,7 +198,6 @@ class NPZImageMaskDataset(Dataset):
         # ------------------------------
         # Normalize images
         # ------------------------------
-        
 
         if len(self.images) != len(self.masks):
             raise ValueError(
@@ -259,7 +263,13 @@ class NPZImageMaskDataset(Dataset):
         channels = img_tensor.shape[0]
         if channels < 3:  # Grayscale or 2-channel
             # Pad along channel dimension (dim=0) to make it 3 channels
-            padding = torch.zeros(3 - channels, img_tensor.shape[1], img_tensor.shape[2], dtype=img_tensor.dtype, device=img_tensor.device)
+            padding = torch.zeros(
+                3 - channels,
+                img_tensor.shape[1],
+                img_tensor.shape[2],
+                dtype=img_tensor.dtype,
+                device=img_tensor.device,
+            )
             img_tensor = torch.cat([img_tensor, padding], dim=0)
         return {"pixel_values": img_tensor, "labels": mask_tensor}
 
@@ -274,12 +284,17 @@ class TiledImageDirDataset(Dataset):
             img_0002.png
             ...
             tile_index.npy
+            tile_index_mask_info.npy (optional, if masks_enabled=True)
 
     tile_index.npy format (per-directory):
-        Shape: (N, 6) or (N, 5)
+        Shape: (N, 6), (N, 7), or (N, 5)
         Columns:
+          - if 7: (ds_idx, sample_idx, y, x, H, W, mask_sample_idx)  # with masks
           - if 6: (ds_idx, sample_idx, y, x, H, W)  # ds_idx is ignored
           - if 5: (sample_idx, y, x, H, W)
+
+    tile_index_mask_info.npy format (optional):
+        Dictionary mapping sample_idx -> mask_path (string)
 
     Arguments:
         root_dir (str or Path): directory containing images + tile_index.npy
@@ -287,6 +302,7 @@ class TiledImageDirDataset(Dataset):
         dtype (torch.dtype): output tensor dtype
         tile_index_filename (str): name of the .npy file with tile index
         recursive (bool): whether to search for images recursively
+        masks_enabled (bool): whether to load masks from mask files
     """
 
     def __init__(
@@ -296,11 +312,13 @@ class TiledImageDirDataset(Dataset):
         dtype=torch.float16,
         tile_index_filename="tile_index.npy",
         recursive=False,
+        masks_enabled=False,
     ):
         self.root_dir = Path(root_dir)
         self.tile_size = tile_size
         self.dtype = dtype
         self.recursive = recursive
+        self.masks_enabled = masks_enabled
 
         if not self.root_dir.is_dir():
             raise FileNotFoundError(f"Directory not found: {self.root_dir}")
@@ -313,40 +331,83 @@ class TiledImageDirDataset(Dataset):
         tile_index = np.load(tile_index_path)
         tile_index = np.asarray(tile_index, dtype=np.int64)
 
-        if tile_index.ndim != 2 or tile_index.shape[1] not in (5, 6):
+        if tile_index.ndim != 2 or tile_index.shape[1] not in (5, 6, 7):
             raise ValueError(
-                f"tile_index at {tile_index_path} must have shape (N,5) or (N,6), "
+                f"tile_index at {tile_index_path} must have shape (N,5), (N,6), or (N,7), "
                 f"got {tile_index.shape}"
             )
 
-        # Drop ds_idx column if present
-        if tile_index.shape[1] == 6:
+        # Check if masks are present in tile_index
+        has_mask_column = tile_index.shape[1] == 7
+
+        # Drop ds_idx column if present, extract mask_sample_idx if present
+        if tile_index.shape[1] == 7:
+            self.mask_sample_indices = tile_index[:, 6]  # Extract mask indices
+            tile_index = tile_index[:, 1:6]  # (sample_idx, y, x, H, W)
+        elif tile_index.shape[1] == 6:
             tile_index = tile_index[:, 1:]  # (sample_idx, y, x, H, W)
+            self.mask_sample_indices = None
+        else:  # shape[1] == 5
+            self.mask_sample_indices = None
 
         # Store per-tile info: (sample_idx, y, x, H, W)
         self.tile_index = tile_index
 
+        # Load mask info if masks are enabled
+        self.mask_info = None
+        self.mask_paths = {}
+        if self.masks_enabled:
+            if not has_mask_column:
+                logger.warning(
+                    f"masks_enabled=True but tile_index does not have mask column. "
+                    f"Masks will not be loaded."
+                )
+                self.masks_enabled = False
+            else:
+                # Load mask_info file
+                mask_info_path = self.root_dir / (
+                    Path(tile_index_filename).stem + "_mask_info.npy"
+                )
+                if mask_info_path.is_file():
+                    self.mask_info = np.load(mask_info_path, allow_pickle=True).item()
+                    logger.info(f"Loaded mask info with {len(self.mask_info)} entries")
+                else:
+                    logger.warning(
+                        f"masks_enabled=True but mask_info file not found: {mask_info_path}. "
+                        f"Masks will not be loaded."
+                    )
+                    self.masks_enabled = False
+
         # 2) Reconstruct the *same* file ordering as used when tile_index was computed
         # In compute_tile_index_dir.py we used: sorted(files) with optional recursion
         # Filter for common image extensions only (exclude .npy and other non-image files)
-        image_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif'}
+        image_extensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
         if self.recursive:
             self.image_paths = sorted(
-                p for p in self.root_dir.rglob("*") 
+                p
+                for p in self.root_dir.rglob("*")
                 if p.is_file() and p.suffix.lower() in image_extensions
             )
         else:
             self.image_paths = sorted(
-                p for p in self.root_dir.iterdir() 
+                p
+                for p in self.root_dir.iterdir()
                 if p.is_file() and p.suffix.lower() in image_extensions
             )
 
         if len(self.image_paths) == 0:
             raise RuntimeError(f"No image files found in directory: {self.root_dir}")
 
+        mask_status = ""
+        if self.masks_enabled and self.mask_info:
+            num_with_masks = sum(
+                1 for idx in self.mask_info.values() if idx is not None
+            )
+            mask_status = f", {num_with_masks} masks"
+
         print(
             f"TiledImageDirDataset: {len(self.tile_index)} tiles from "
-            f"{len(self.image_paths)} files in {self.root_dir}"
+            f"{len(self.image_paths)} files{mask_status} in {self.root_dir}"
         )
 
     # ---------- helpers ----------
@@ -366,9 +427,11 @@ class TiledImageDirDataset(Dataset):
                 arr = np.array(img)
         except (OSError, IOError) as e:
             # Log the error and return a black image as fallback
-            logger.warning(f"Failed to load image {img_path}: {e}. Using black image as fallback.")
+            logger.warning(
+                f"Failed to load image {img_path}: {e}. Using black image as fallback."
+            )
             # Get expected dimensions from tile_index if available
-            if hasattr(self, 'tile_index') and sample_idx < len(self.tile_index):
+            if hasattr(self, "tile_index") and sample_idx < len(self.tile_index):
                 # Use first occurrence of this sample_idx
                 mask = self.tile_index[:, 0] == sample_idx
                 if mask.any():
@@ -387,6 +450,37 @@ class TiledImageDirDataset(Dataset):
             arr = arr[..., None]
         return arr  # HWC
 
+    def _load_mask(self, mask_sample_idx: int):
+        """
+        Load the mask corresponding to mask_sample_idx using PIL,
+        convert to HW numpy array.
+        Returns None if mask_sample_idx is -1 or mask path not found.
+        """
+        if mask_sample_idx < 0:
+            return None
+
+        if self.mask_info is None or mask_sample_idx not in self.mask_info:
+            return None
+
+        mask_path = Path(self.mask_info[mask_sample_idx])
+
+        # Make path absolute if it's relative
+        if not mask_path.is_absolute():
+            mask_path = self.root_dir / mask_path
+
+        try:
+            with Image.open(mask_path) as mask_img:
+                mask_img.load()
+                # Convert to grayscale/single channel
+                if mask_img.mode not in ("L", "I"):
+                    mask_img = mask_img.convert("L")
+                mask_arr = np.array(mask_img)
+        except (OSError, IOError) as e:
+            logger.warning(f"Failed to load mask {mask_path}: {e}. Returning None.")
+            return None
+
+        return mask_arr  # (H, W)
+
     def _image_array_to_tensor(self, arr: np.ndarray) -> torch.Tensor:
         """
         HWC numpy -> normalized CHW torch tensor in self.dtype
@@ -396,7 +490,13 @@ class TiledImageDirDataset(Dataset):
         tensor = torch.from_numpy(arr).permute(2, 0, 1).to(self.dtype)
         # Pad the channels dimension to be of size 3 with zeros if necessary
         if tensor.shape[0] < 3:
-            padding = torch.zeros(3 - tensor.shape[0], tensor.shape[1], tensor.shape[2], dtype=tensor.dtype, device=tensor.device)
+            padding = torch.zeros(
+                3 - tensor.shape[0],
+                tensor.shape[1],
+                tensor.shape[2],
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
             tensor = torch.cat([tensor, padding], dim=0)
         return tensor
 
@@ -408,7 +508,9 @@ class TiledImageDirDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            dict with key "pixel_values": tensor(C, tile_size, tile_size)
+            dict with keys "pixel_values" and "labels"
+            - pixel_values: tensor(C, tile_size, tile_size)
+            - labels: tensor(1, tile_size, tile_size) - mask or dummy zeros
         """
         sample_idx, y, x, H, W = self.tile_index[idx]
         tile_size = self.tile_size
@@ -419,12 +521,12 @@ class TiledImageDirDataset(Dataset):
         # Use stored H, W only as sanity if you want:
         # assert arr.shape[0] == H and arr.shape[1] == W
 
-        # Extract tile
+        # Extract image tile
         y_end = min(y + tile_size, arr.shape[0])
         x_end = min(x + tile_size, arr.shape[1])
         tile = arr[y:y_end, x:x_end, :]
 
-        # Pad if necessary
+        # Pad image tile if necessary
         h, w = tile.shape[:2]
         if h < tile_size or w < tile_size:
             padded = np.zeros((tile_size, tile_size, tile.shape[2]), dtype=tile.dtype)
@@ -432,9 +534,38 @@ class TiledImageDirDataset(Dataset):
             tile = padded
 
         img_tensor = self._image_array_to_tensor(tile)
-        # Add dummy labels for compatibility with data collators expecting labels
-        dummy_labels = torch.zeros((1, tile_size, tile_size), dtype=self.dtype)
-        return {"pixel_values": img_tensor, "labels": dummy_labels}
+
+        # Load mask if enabled
+        if self.masks_enabled and self.mask_sample_indices is not None:
+            mask_sample_idx = int(self.mask_sample_indices[idx])
+            mask_arr = self._load_mask(mask_sample_idx)
+
+            if mask_arr is not None:
+                # Extract mask tile
+                mask_y_end = min(y + tile_size, mask_arr.shape[0])
+                mask_x_end = min(x + tile_size, mask_arr.shape[1])
+                mask_tile = mask_arr[y:mask_y_end, x:mask_x_end]
+
+                # Pad mask tile if necessary
+                if mask_tile.shape[0] < tile_size or mask_tile.shape[1] < tile_size:
+                    padded_mask = np.zeros(
+                        (tile_size, tile_size), dtype=mask_tile.dtype
+                    )
+                    padded_mask[: mask_tile.shape[0], : mask_tile.shape[1]] = mask_tile
+                    mask_tile = padded_mask
+
+                # Convert mask to tensor
+                mask_tensor = (
+                    torch.from_numpy(mask_tile).unsqueeze(0).to(self.dtype)
+                )  # (1, H, W)
+            else:
+                # Fallback to dummy labels if mask loading failed
+                mask_tensor = torch.zeros((1, tile_size, tile_size), dtype=self.dtype)
+        else:
+            # Add dummy labels for compatibility with data collators expecting labels
+            mask_tensor = torch.zeros((1, tile_size, tile_size), dtype=self.dtype)
+
+        return {"pixel_values": img_tensor, "labels": mask_tensor}
 
 
 class DistillationDatasetWrapperIndex(Dataset):
@@ -519,7 +650,11 @@ class CombinedImageMaskDataset(Dataset):
                 ds = NPZImageMaskDataset(path, dtype=dtype, name=name)
             else:
                 ds = ImageMaskDataset(
-                    path, img_suffix=img_suffix, mask_suffix=mask_suffix, dtype=dtype, name=name
+                    path,
+                    img_suffix=img_suffix,
+                    mask_suffix=mask_suffix,
+                    dtype=dtype,
+                    name=name,
                 )
             self.datasets.append(ds)
             self.offsets.append(self.offsets[-1] + len(ds))
@@ -543,14 +678,14 @@ class CombinedImageMaskDataset(Dataset):
         raise IndexError(f"Index {idx} out of range")
 
 
-def get_train_val_dataset():
+def get_train_val_dataset_distilled():
     train_datasets = []
     val_datasets = []
     paths = (
         CELL_TRAIN_DATASET_PATHS
         if TRAINING_ARGS.get("train_on_cellular", True)
         else SA1B_TRAIN_DATASET_PATH
-)   
+    )
     for path in paths:
         val_ds = None
         if str(path).endswith(".npz"):
@@ -576,11 +711,36 @@ def get_test_dataset():
         if str(path).endswith(".npz"):
             ds = NPZImageMaskDataset(path, dtype=torch.float32, name=name)
         else:
-            ds = ImageMaskDataset(
-                path, dtype=torch.float32, name=name
-            )
+            ds = ImageMaskDataset(path, dtype=torch.float32, name=name)
         datasets[name] = ds
     return datasets
+
+
+def get_train_val_dataset_decoder():
+    train_datasets = []
+    val_datasets = []
+    paths = CELL_TRAIN_DATASET_PATHS_DECODER
+    for path in paths:
+        val_ds = None
+        if str(path).endswith(".npz"):
+            train_ds = NPZImageMaskDataset(path, dtype=torch.float32)
+        else:
+            ds = TiledImageDirDataset(
+                root_dir=path, dtype=torch.float32, masks_enabled=True
+            )
+            # Split dataset into 90% train and 10% validation
+            train_size = int(0.9 * len(ds))
+            val_size = len(ds) - train_size
+            train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
+        train_datasets.append(train_ds)
+        if val_ds is not None:
+            val_datasets.append(val_ds)
+    combined_train_dataset = DistillationDatasetWrapperIndex(datasets=train_datasets)
+    combined_val_dataset = DistillationDatasetWrapperIndex(
+        datasets=val_datasets
+    )
+    return combined_train_dataset, combined_val_dataset
+
 
 def get_val_dataset():
     datasets = []

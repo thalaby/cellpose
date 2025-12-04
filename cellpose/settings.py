@@ -18,7 +18,7 @@ MODEL_PATH = (
 )
 
 SA1B_DATASET_PATH = (
-    "/storage/timorhalabi/Research/cellpose/SA-1B/images"
+    "/storage/timorhalabi/Research/cellpose/SA-1B"
 )
 CELL_TRAIN_DATASET_PATHS = [
                     #    Path(DATA_PATH, 'Cellpose', 'train'),
@@ -31,12 +31,15 @@ CELL_TRAIN_DATASET_PATHS = [
                        Path(DATA_PATH, "Deepcell/DynamicNuclearNet-segmentation-v1_0/train.npz"), 
                     #    Path(DATA_PATH, "NeurIPS/release-part1")
                        ]
+
+CELL_TRAIN_DATASET_PATHS_DECODER = [Path(DATA_PATH, "CellposeNDecoder/train"),
+                                    Path(DATA_PATH, "CellposeDecoder/train")]
 CELL_EVAL_DATASET_PATHS = [Path(DATA_PATH, "Deepcell/tissuenet_v1.1_val.npz"),
                        Path(DATA_PATH, "Deepcell/DynamicNuclearNet-segmentation-v1_0/val.npz")]
 # CELL_TRAIN_DATASET_PATHS = [
                     #    "/storage/timorhalabi/Research/cellpose/SA-mini/images"]
 
-SA1B_TRAIN_DATASET_PATH = [SA1B_DATASET_PATH]
+SA1B_TRAIN_DATASET_PATH = [SA1B_DATASET_PATH + "/images"]
 
 TRAINING_ARGS = {"train_on_cellular": True,
                  "train": True,

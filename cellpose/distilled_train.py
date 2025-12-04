@@ -1,6 +1,6 @@
 from vit_sam import Transformer
 from vit_tiny import SAMStyleTinyViTEncoder, SAMStyleTinyViTDecoder
-from dataset_utils import get_train_val_dataset, get_test_dataset
+from dataset_utils import get_train_val_dataset_distilled, get_test_dataset
 from settings import MODEL_PATH, TRAINING_ARGS
 
 from train_utils import (
@@ -112,8 +112,8 @@ def main(
     test_dataset = get_test_dataset()
     # logger.info(f"test tiles: {len(test_dataset)}")
 
-    logger.info("Creating training dataset...")
-    train_dataset, eval_dataset = get_train_val_dataset()
+    logger.info("Creating training dataset for distilled train...")
+    train_dataset, eval_dataset = get_train_val_dataset_distilled()
     logger.info(f"Train tiles: {len(train_dataset)}, Eval tiles: {len(eval_dataset)}")
     
     
@@ -217,10 +217,10 @@ def main_test():
 
     # Run final test with segmentation metrics
     logger.info("Starting Test with segmentation metrics on test dataset...")
+    import ipdb; ipdb.set_trace()
     wandb.init(project="cellpose_distillation", name="distillation_test_run")
     test_metrics_mine = trainer_mine.test(test_dataset=test_dataset)
     test_metrics_not_mine = trainer_not_mine.test(test_dataset=test_dataset)
-    import ipdb; ipdb.set_trace()
 
 
     
