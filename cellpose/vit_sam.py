@@ -81,7 +81,7 @@ class Transformer(nn.Module):
         x1 = F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
         
         # maintain the second output of feature size 256 for backwards compatibility
-        print(f"total forward: {time.time() - t0:.4f}s")
+        # print(f"total forward: {time.time() - t0:.4f}s")
         return x1, torch.zeros((x.shape[0], 256), device=x.device)
     
     def load_model(self, PATH, device, strict = False):        

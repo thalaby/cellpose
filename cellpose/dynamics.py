@@ -249,7 +249,7 @@ def labels_to_flows(labels, files=None, device=None, redo_flows=False, niter=Non
     flows = []
     # flows need to be recomputed
     if labels[0].shape[0] == 1 or labels[0].ndim < 3 or redo_flows:
-        dynamics_logger.info("computing flows for labels")
+        # dynamics_logger.info("computing flows for labels")
 
         # compute flows; labels are fixed here to be unique, so they need to be passed back
         # make sure labels are unique!
