@@ -1,4 +1,4 @@
-from cellpose.Mobile.utils.dataset_utils import get_train_val_dataset_distilled, get_test_dataset
+from cellpose.Mobile.utils.dataset_utils import get_train_val_dataset_formatted, get_test_dataset
 from cellpose.Mobile.utils.settings import TRAINING_ARGS
 from cellpose.Mobile.utils.utils import load_models, create_cellpose_model
 
@@ -12,9 +12,18 @@ from safetensors.torch import load_file
 from transformers import TrainingArguments
 from logging import getLogger
 import torch
+import torch.multiprocessing
 import logging
 import numpy as np
 import wandb
+
+# Configure multiprocessing for containerized environments
+# This prevents DataLoader worker hangs in non-interactive mode
+if torch.multiprocessing.get_start_method(allow_none=True) != "spawn":
+    torch.multiprocessing.set_start_method("spawn", force=True)
+
+# Use file_system sharing strategy to avoid shared memory issues in containers
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # Configure logging to print to stdout
 logging.basicConfig(
@@ -30,9 +39,12 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
     default_args = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
-        "num_train_epochs": 4,
-        "per_device_train_batch_size": 128,
-        "per_device_eval_batch_size": 128,
+        "num_train_epochs": 50,
+        "per_device_train_batch_size": 256,
+        "per_device_eval_batch_size": 256,
+        "dataloader_num_workers": 8,  # Use 4 workers with proper multiprocessing configuration
+        "dataloader_persistent_workers": True,  # Keep workers alive between epochs for efficiency
+        "dataloader_prefetch_factor": 2,  # Prefetch 2 batches per worker
         "learning_rate": 5e-4,
         "warmup_steps": 500,
         "weight_decay": 0.01,
@@ -44,8 +56,7 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "fp16": False,  # Disable FP16 since models are already float16
         "gradient_accumulation_steps": 1,
         "remove_unused_columns": False,
-        "report_to": "none",
-        "dataloader_num_workers": 8,
+        "report_to": "wandb",
         "eval_strategy": "epoch",  # Run validation after every epoch
         "save_strategy": "epoch",  # Save checkpoint after every epoch
     }
@@ -74,7 +85,7 @@ def main(
     # student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
     distillation_model = DistillationModel(student_encoder, teacher_encoder)
     distillation_model.to(device, dtype=dtype)
-    state_dict = load_file('good_checkpoints/checkpoint-post-sa-1b/model.safetensors', device='cpu')
+    state_dict = load_file('good_checkpoints/checkpoint-post-distilled-sa-1b/model.safetensors', device='cpu')
     distillation_model.load_state_dict(state_dict)
     distillation_model.to(device, dtype=dtype)
 
@@ -84,11 +95,11 @@ def main(
     
     # Create test dataset from multiple paths
     logger.info("Creating test dataset...")
-    test_dataset = get_test_dataset()
+    # test_dataset = get_test_dataset()
     # logger.info(f"test tiles: {len(test_dataset)}")
 
     logger.info("Creating training dataset for distilled train...")
-    train_dataset, eval_dataset = get_train_val_dataset_distilled()
+    train_dataset, eval_dataset = get_train_val_dataset_formatted()
     logger.info(f"Train tiles: {len(train_dataset)}, Eval tiles: {len(eval_dataset)}")
     
     

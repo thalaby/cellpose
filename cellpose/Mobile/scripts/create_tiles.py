@@ -63,8 +63,8 @@ def compute_tile_index_for_image(
     tile_size: int,
     ds_idx: int = 0,
     include_masks: bool = False,
-    masks_filter: str = '_masks',
-    img_suffix: str = '_img',
+    masks_filter: str = '_mask',
+    img_suffix: str = '_im',
     compute_flows: bool = False,
     device=None,
 ):
@@ -80,10 +80,24 @@ def compute_tile_index_for_image(
     If compute_flows is True, also computes and saves flow files.
     """
     try:
-        # Use PIL to support many formats (PNG, JPG, TIFF, etc.)
-        with Image.open(image_path) as img:
-            # Ensure it's loaded enough to get size
-            W, H = img.size  # PIL gives (W, H)
+        # Try tifffile first for TIFF files (better support for scientific TIFFs)
+        if image_path.suffix.lower() in ['.tif', '.tiff']:
+            try:
+                img = tifffile.imread(str(image_path))
+                if img.ndim == 2:
+                    H, W = img.shape
+                elif img.ndim == 3:
+                    H, W = img.shape[:2]
+                else:
+                    raise ValueError(f"Unexpected image dimensions: {img.ndim}")
+            except Exception as tiff_err:
+                # Fallback to PIL
+                with Image.open(image_path) as img:
+                    W, H = img.size  # PIL gives (W, H)
+        else:
+            # Use PIL for non-TIFF formats (PNG, JPG, etc.)
+            with Image.open(image_path) as img:
+                W, H = img.size  # PIL gives (W, H)
     except Exception as e:
         # On failure, return empty array and the error
         cols = 7 if include_masks else 6
@@ -101,18 +115,21 @@ def compute_tile_index_for_image(
         
         # Check if the image name ends with img_suffix
         if img_stem.endswith(img_suffix):
-            # Extract the prefix (e.g., "000" from "000_img")
+            # Extract the prefix (e.g., "A172_Phase_C7_1_00d00h00m_1" from "A172_Phase_C7_1_00d00h00m_1_im")
             prefix = img_stem[:-len(img_suffix)]
             mask_stem = prefix + masks_filter
             
-            # Try to find mask file with any supported extension
-            supported_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff']
-            for ext in supported_extensions:
-                potential_mask = img_dir / (mask_stem + ext)
+            # Look for mask file with .tif/.tiff extension (prioritizing .tif)
+            potential_mask = img_dir / (mask_stem + '.tif')
+            if potential_mask.is_file():
+                mask_path = potential_mask
+                mask_sample_idx = sample_idx  # Use same index for now
+            else:
+                # Try .tiff as fallback
+                potential_mask = img_dir / (mask_stem + '.tiff')
                 if potential_mask.is_file():
                     mask_path = potential_mask
-                    mask_sample_idx = sample_idx  # Use same index for now
-                    break
+                    mask_sample_idx = sample_idx
             
             # Compute flows if mask was found and compute_flows is enabled
             if mask_path is not None and compute_flows:
@@ -138,11 +155,11 @@ def compute_tile_index_for_image(
     return sample_idx, image_path, mask_path, flow_path, tile_index, None
 
 
-def collect_image_paths(input_dir: Path, recursive: bool = False, img_suffix: str = '_img', include_masks: bool = False):
+def collect_image_paths(input_dir: Path, recursive: bool = False, img_suffix: str = '_im', include_masks: bool = False):
     """
     Collect all files in a directory that look like images.
     If include_masks is True, only collect files that end with img_suffix.
-    Excludes flow files (_flows.tif) and mask files (_masks.*).
+    Excludes flow files (_flows.tif) and mask files (_mask.*).
     """
     if recursive:
         all_paths = sorted(p for p in input_dir.rglob("*") if p.is_file())
@@ -153,7 +170,7 @@ def collect_image_paths(input_dir: Path, recursive: bool = False, img_suffix: st
     all_paths = [
         p for p in all_paths 
         if not p.stem.endswith('_flows') 
-        and not p.stem.endswith('_masks')
+        and not p.stem.endswith('_mask')
         and p.suffix.lower() != '.npy'
     ]
     
@@ -193,8 +210,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="tile_index.npy",
-        help="Output .npy file for the combined tile_index (default: tile_index.npy).",
+        default=None,
+        help="Output .npy file for the combined tile_index.",
     )
     parser.add_argument(
         "--workers",
@@ -216,14 +233,14 @@ def main():
     parser.add_argument(
         "--masks_filter",
         type=str,
-        default='_masks',
-        help="Suffix for mask files (default: '_masks'). E.g., if image is '000_img.png', mask is '000_masks.png'.",
+        default='_mask',
+        help="Suffix for mask files (default: '_mask'). E.g., if image is 'A172_Phase_C7_1_00d00h00m_1_im.tif', mask is 'A172_Phase_C7_1_00d00h00m_1_mask.tif'.",
     )
     parser.add_argument(
         "--img_suffix",
         type=str,
-        default='_img',
-        help="Suffix for image files (default: '_img'). Used when --include_masks is enabled.",
+        default='_im',
+        help="Suffix for image files (default: '_im'). Used when --include_masks is enabled.",
     )
     parser.add_argument(
         "--compute_flows",
@@ -246,7 +263,10 @@ def main():
 
     tile_size = args.B
     ds_idx = args.ds_idx
-    out_path = Path(args.output)
+    if args.output is None:
+        out_path = input_dir / "tile_index.npy"
+    else:
+        out_path = Path(args.output)
     
     # Parse device if provided
     device = None
