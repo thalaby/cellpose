@@ -3,10 +3,108 @@ from transformers.trainer_utils import EvalLoopOutput
 from cellpose import models
 from tqdm import tqdm
 
-import torch.nn as nn
 import numpy as np
+import torch.nn as nn
 import torch
 
+def perform_test(
+    model,
+    test_dataset=None,
+    metric_key_prefix="test",
+    model_name="decoder_model",
+    report_wandb=False
+):
+    """Custom test loop for decoder model evaluation"""
+    from cellpose import metrics
+
+    if test_dataset is None:
+        raise ValueError("No test dataset provided")
+
+    # Ensure model is in eval mode
+    device = model.device
+
+    masks_gt_all = []
+    masks_pred_all = []
+
+    # Create dataloader for test
+    for dataset_name in test_dataset.keys():
+        print(
+            f"Test dataset: {dataset_name}, samples: {len(test_dataset[dataset_name])}"
+        )
+
+        print(f"\nRunning segmentation test on {len(test_dataset[dataset_name])} samples...")
+
+        sample_count = 0
+        threshold = [0.5, 0.75, 0.9]
+        masks_gt_all = []
+        masks_pred_all = []
+        with torch.no_grad():
+            for image in tqdm(test_dataset[dataset_name], desc="Testing"):
+                # Extract images and masks from batch dict
+                img = image["pixel_values"].to(device)
+                masks_gt = image["labels"]
+                img = img.permute(1, 2, 0)  # (C, H, W) -> (H, W, C)
+                mask_gt = masks_gt.squeeze().cpu().numpy().astype(np.int16)
+
+                # Run cellpose evaluation
+                masks_pred, flows, styles = model.eval(img)
+
+                masks_gt_all.append(mask_gt)
+                masks_pred_all.append(masks_pred)
+                sample_count += 1
+
+        # Compute final metrics for the dataset
+        ap, tp, fp, fn = metrics.average_precision(masks_gt_all, masks_pred_all)
+        if report_wandb:
+            import wandb
+
+            for i, thr in enumerate(threshold):
+                wandb.log(
+                    {
+                        f"{model_name}_{metric_key_prefix}_{thr}_mean_ap_at_{dataset_name}": ap[
+                            :, i
+                        ].mean(),
+                        f"{model_name}_{metric_key_prefix}_{thr}_mean_tp_at_{dataset_name}": tp[
+                            :, i
+                        ].mean(),
+                        f"{model_name}_{metric_key_prefix}_{thr}_mean_fp_at_{dataset_name}": fp[
+                            :, i
+                        ].mean(),
+                        f"{model_name}_{metric_key_prefix}_{thr}_mean_fn_at_{dataset_name}": fn[
+                            :, i
+                        ].mean(),
+                        f"{model_name}_{metric_key_prefix}_{dataset_name}_total_samples": sample_count,
+                    }
+                )
+
+    # Compute final metrics
+    ap, tp, fp, fn = metrics.average_precision(masks_gt_all, masks_pred_all)
+    test_metrics = {}
+    for i, thr in enumerate(threshold):
+        test_metrics[i] = {
+            f"{model_name}_{metric_key_prefix}_{thr}_mean_ap": ap[:, i].mean(),
+            f"{model_name}_{metric_key_prefix}_{thr}_mean_tp": tp[:, i].mean(),
+            f"{model_name}_{metric_key_prefix}_{thr}_mean_fp": fp[:, i].mean(),
+            f"{model_name}_{metric_key_prefix}_{thr}_mean_fn": fn[:, i].mean(),
+            f"{model_name}_{metric_key_prefix}_total_samples": sample_count,
+        }
+
+    # Log final metrics to wandb
+    if report_wandb:
+        import wandb
+
+        print("\nRecording to wandb:")
+        for i, thr in enumerate(threshold):
+            wandb.log(test_metrics[i])
+
+    # Print results
+    print(f"\nTest Results ({sample_count} samples):")
+    print(f"  Mean AP: {ap[:, 0].mean():.4f}")
+    print(f"  Mean TP: {tp[:, 0].mean():.4f}")
+    print(f"  Mean FP: {fp[:, 0].mean():.4f}")
+    print(f"  Mean FN: {fn[:, 0].mean():.4f}")
+
+    return test_metrics
 
 class StudentSegmentationModel(nn.Module):
     def __init__(self, encoder, decoder, device="cuda", dtype=torch.float32):
@@ -160,9 +258,8 @@ class DistillationTrainer(Trainer):
     def test(
         self,
         test_dataset=None,
-        ignore_keys=None,
+        model_name="distilled_model",
         metric_key_prefix="test",
-        log_every_n=10,
     ):
         """
         Run final test with segmentation metrics on image-mask pairs.
@@ -173,87 +270,13 @@ class DistillationTrainer(Trainer):
             test_dataset: Dataset with image-mask pairs for segmentation evaluation
             log_every_n: Log metrics to wandb every n samples (default: 10)
         """
-        from cellpose import metrics
-
-        if test_dataset is None:
-            raise ValueError("No test dataset provided")
-
-        # Ensure model is in eval mode
-        self.model.eval()
-        device = self.args.device
-
-        masks_gt_all = []
-        masks_pred_all = []
-
-        # Create dataloader for test
-        for dataset_name in test_dataset.keys():
-            print(
-                f"Test dataset: {dataset_name}, samples: {len(test_dataset[dataset_name])}"
-            )
-
-            print(f"\nRunning segmentation test on {len(test_dataset)} samples...")
-
-            sample_count = 0
-            threshold = [0.5, 0.75, 0.9]
-            with torch.no_grad():
-                for image in tqdm(test_dataset[dataset_name], desc="Testing"):
-                    # Extract images and masks from batch dict
-                    img = image["pixel_values"].to(device)
-                    masks_gt = image["labels"]
-                    img = img.permute(1, 2, 0)  # (C, H, W) -> (H, W, C)
-                    mask_gt = masks_gt.squeeze().cpu().numpy().astype(np.int16)
-
-                    # Run cellpose evaluation
-                    masks_pred, flows, styles = self.cellpose_model.eval(img)
-
-                    masks_gt_all.append(mask_gt)
-                    masks_pred_all.append(masks_pred)
-                    sample_count += 1
-
-                    # # Log intermediate metrics every n samples
-                    # if sample_count % log_every_n == 0 and self.args.report_to and "wandb" in self.args.report_to:
-                    #     import wandb
-                    #     # Compute metrics on accumulated samples so far
-                    #     ap_partial, tp_partial, fp_partial, fn_partial = metrics.average_precision(
-                    #         masks_gt_all, masks_pred_all
-                    #     )
-                    #     for i, thr in enumerate(threshold):
-                    #         wandb.log({
-                    #             f"{metric_key_prefix}_{thr}_ap_at_{dataset_name}": ap_partial[i],
-                    #             f"{metric_key_prefix}_{thr}_tp_at_{dataset_name}": tp_partial[i],
-                    #             f"{metric_key_prefix}_{thr}_fp_at_{dataset_name}": fp_partial[i],
-                    #             f"{metric_key_prefix}_{thr}_fn_at_{dataset_name}": fn_partial[i],
-                    #             f"{metric_key_prefix}_samples_evaluated": sample_count,
-                    #         })
-
-        # Compute final metrics
-        ap, tp, fp, fn = metrics.average_precision(masks_gt_all, masks_pred_all)
-        test_metrics = {}
-        for i, thr in enumerate(threshold):
-            test_metrics[i] = {
-                f"{metric_key_prefix}_{thr}_mean_ap": ap[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_tp": tp[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_fp": fp[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_fn": fn[:, i].mean(),
-                f"{metric_key_prefix}_total_samples": sample_count,
-            }
-
-        # Log final metrics to wandb
-        if self.args.report_to and "wandb" in self.args.report_to:
-            import wandb
-
-            for i, thr in enumerate(threshold):
-                wandb.log(test_metrics[i])
-
-        # Print results
-        print(f"\nTest Results ({sample_count} samples):")
-        print(f"  Mean AP: {ap[:, 0].mean():.4f}")
-        print(f"  Mean TP: {tp[:, 0].mean():.4f}")
-        print(f"  Mean FP: {fp[:, 0].mean():.4f}")
-        print(f"  Mean FN: {fn[:, 0].mean():.4f}")
-
-        return test_metrics
-
+        return perform_test(
+            model=self.cellpose_model,
+            test_dataset=test_dataset,
+            metric_key_prefix=metric_key_prefix,
+            model_name=model_name,
+            report_wandb=self.args.report_to and "wandb" in self.args.report_to,
+        )
 
 class DecoderTrainer(Trainer):
     def __init__(

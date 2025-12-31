@@ -15,12 +15,10 @@ Implements the full augmentation pipeline described in the Cellpose-SAM paper:
 - Contrast jitter (factor between -2 and 2)
 """
 
-import os
 import numpy as np
 import torch
 import cv2
 import tifffile
-import time
 
 from pathlib import Path
 from PIL import Image, ImageFile
@@ -64,6 +62,7 @@ class CellposeSAMLoader(Dataset):
         root_dir,
         img_suffix="_im",
         mask_suffix="_mask",
+        flow_suffix="_flow",
         crop_size=256,
         mean_cell_diameter=30,
         scale_range=(0.25, 4.0),
@@ -75,10 +74,12 @@ class CellposeSAMLoader(Dataset):
         enable_cache=True,
         dtype=torch.float32,
         compute_flows=True,
+        name=None
     ):
         self.root_dir = Path(root_dir)
         self.img_suffix = img_suffix
         self.mask_suffix = mask_suffix
+        self.flow_suffix = flow_suffix
         self.crop_size = crop_size
         self.mean_cell_diameter = mean_cell_diameter
         self.scale_range = scale_range
@@ -90,6 +91,8 @@ class CellposeSAMLoader(Dataset):
         self.enable_cache = enable_cache
         self.dtype = dtype
         self.compute_flows = compute_flows
+        if name is None:
+            self.name = self.root_dir.stem
 
         # Cache for images and masks
         self.image_cache = {}
@@ -131,7 +134,7 @@ class CellposeSAMLoader(Dataset):
         print(f"  Has masks: {self.has_masks}")
 
     def _find_samples(self):
-        """Find all image/mask pairs in the directory."""
+        """Find all image/mask/flow triplets in the directory."""
         samples = []
         img_extensions = [".tif", ".tiff", ".png", ".jpg", ".jpeg"]
 
@@ -151,9 +154,22 @@ class CellposeSAMLoader(Dataset):
                         mask_path = candidate
                         break
 
-                # Add sample even if no mask is found
+                # Look for corresponding flow file
+                flow_path = None
+                for flow_ext in [".tif", ".tiff"]:  # Flows are typically TIFF
+                    candidate = self.root_dir / f"{prefix}{self.flow_suffix}{flow_ext}"
+                    if candidate.exists():
+                        flow_path = candidate
+                        break
+
+                # Add sample even if no mask/flow is found
                 samples.append(
-                    {"img_path": img_path, "mask_path": mask_path, "prefix": prefix}
+                    {
+                        "img_path": img_path,
+                        "mask_path": mask_path,
+                        "flow_path": flow_path,
+                        "prefix": prefix,
+                    }
                 )
 
         return sorted(samples, key=lambda x: x["prefix"])
@@ -224,6 +240,27 @@ class CellposeSAMLoader(Dataset):
 
         return mask
 
+    def _load_flow(self, path):
+        """Load pre-computed flow with caching."""
+        if self.enable_cache and path in self.flow_cache:
+            return self.flow_cache[path].copy()
+
+        try:
+            flow = tifffile.imread(str(path))
+        except Exception:
+            flow = np.array(Image.open(path))
+
+        # Flow should be (2, H, W) format: [flowY, flowX]
+        if flow.ndim == 3 and flow.shape[0] != 2:
+            # If it's (H, W, 2), transpose to (2, H, W)
+            if flow.shape[2] == 2:
+                flow = np.transpose(flow, (2, 0, 1))
+
+        if self.enable_cache:
+            self.flow_cache[path] = flow.copy()
+
+        return flow
+
     def _normalize_percentile(self, img):
         """Normalize image so 0=1st percentile, 1=99th percentile."""
         img = img.astype(np.float32)
@@ -240,14 +277,19 @@ class CellposeSAMLoader(Dataset):
 
         return img
 
-    def _random_rotate_and_resize(self, img, mask, diameter):
-        """Apply random rotation, flipping, and resizing."""
+    def _random_rotate_and_resize(self, img, mask, diameter, flow=None):
+        """Apply random rotation, flipping, and resizing to image, mask, and optionally flow."""
         H, W, C = img.shape
 
         # Random flip
-        if np.random.rand() > 0.5:
+        do_flip = np.random.rand() > 0.5
+        if do_flip:
             img = img[:, ::-1, :]
             mask = mask[:, ::-1]
+            if flow is not None:
+                flow = flow[:, :, ::-1]
+                # When flipping horizontally, negate flowX (channel 1)
+                flow[1] = -flow[1]
 
         # Random rotation angle
         theta = np.random.rand() * 360
@@ -257,7 +299,7 @@ class CellposeSAMLoader(Dataset):
             np.log(self.scale_range[0]), np.log(self.scale_range[1])
         )
         scale = np.exp(log_scale)
-        scale = np.clip(scale, 0.25, 4.0)  # or tighter, e.g. 0.5..2.5
+        scale = np.clip(scale, 0.25, 4.0)
 
         # Adjust scale based on diameter
         scale *= self.mean_cell_diameter / diameter
@@ -272,7 +314,7 @@ class CellposeSAMLoader(Dataset):
         # Get rotation matrix
         M = cv2.getRotationMatrix2D(center, theta, scale)
 
-        # warp image in one shot (multi-channel)
+        # Transform image
         img_transformed = cv2.warpAffine(
             img,
             M,
@@ -281,8 +323,8 @@ class CellposeSAMLoader(Dataset):
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-    
-        # Convert mask to int32 for OpenCV compatibility (doesn't support int64)
+
+        # Transform mask
         mask_transformed = cv2.warpAffine(
             mask,
             M,
@@ -292,36 +334,74 @@ class CellposeSAMLoader(Dataset):
             borderValue=0,
         )
 
-        return img_transformed, mask_transformed
+        # Transform flow if provided
+        if flow is not None:
+            # Flow is (2, H, W) -> transpose to (H, W, 2) for cv2
+            flow_hw2 = np.transpose(flow, (1, 2, 0))
+            
+            # Apply same spatial transformation
+            flow_transformed = cv2.warpAffine(
+                flow_hw2,
+                M,
+                (new_W, new_H),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            
+            # Rotate flow vectors by theta
+            # Convert angle to radians
+            theta_rad = np.deg2rad(theta)
+            cos_theta = np.cos(theta_rad)
+            sin_theta = np.sin(theta_rad)
+            
+            # Extract flowY and flowX
+            flow_y = flow_transformed[:, :, 0]
+            flow_x = flow_transformed[:, :, 1]
+            
+            # Rotate vectors: [flowY', flowX'] = R * [flowY, flowX]
+            flow_y_rot = cos_theta * flow_y - sin_theta * flow_x
+            flow_x_rot = sin_theta * flow_y + cos_theta * flow_x
+            
+            # Stack back and transpose to (2, H, W)
+            flow_transformed = np.stack([flow_y_rot, flow_x_rot], axis=0)
+        else:
+            flow_transformed = None
 
-    def _random_crop(self, img, mask):
+        return img_transformed, mask_transformed, flow_transformed
+
+    def _random_crop(self, img, mask, flow=None):
         """Randomly crop to crop_size x crop_size."""
         H, W, C = img.shape
 
-        # Handle each dimension independently - crop if too large, pad if too small
+        # Determine crop coordinates
+        y_start = 0
+        x_start = 0
 
         # Handle height
         if H > self.crop_size:
-            # Crop height
             y_start = np.random.randint(0, H - self.crop_size + 1)
             img = img[y_start : y_start + self.crop_size, :, :]
             mask = mask[y_start : y_start + self.crop_size, :]
+            if flow is not None:
+                flow = flow[:, y_start : y_start + self.crop_size, :]
             H = self.crop_size
 
         # Handle width
         if W > self.crop_size:
-            # Crop width
             x_start = np.random.randint(0, W - self.crop_size + 1)
             img = img[:, x_start : x_start + self.crop_size, :]
             mask = mask[:, x_start : x_start + self.crop_size]
+            if flow is not None:
+                flow = flow[:, :, x_start : x_start + self.crop_size]
             W = self.crop_size
 
-        # Now pad if needed (either or both dimensions might need padding)
+        # Pad if needed
         if H < self.crop_size or W < self.crop_size:
             img_padded = np.zeros((self.crop_size, self.crop_size, C), dtype=np.float32)
             mask_padded = np.zeros((self.crop_size, self.crop_size), dtype=mask.dtype)
 
-            # Center the image in the padded space
+            # Center the content in the padded space
             start_y = (self.crop_size - H) // 2
             start_x = (self.crop_size - W) // 2
 
@@ -331,7 +411,12 @@ class CellposeSAMLoader(Dataset):
             img = img_padded
             mask = mask_padded
 
-        return img, mask
+            if flow is not None:
+                flow_padded = np.zeros((2, self.crop_size, self.crop_size), dtype=flow.dtype)
+                flow_padded[:, start_y : start_y + H, start_x : start_x + W] = flow
+                flow = flow_padded
+
+        return img, mask, flow
 
     def _convert_to_grayscale(self, img, image_type="auto"):
         """
@@ -430,7 +515,6 @@ class CellposeSAMLoader(Dataset):
 
         sample = self.samples[idx]
         diameter = self.diameters[idx]
-
         # Load image and mask
         img = self._load_image(sample["img_path"])
         
@@ -450,14 +534,19 @@ class CellposeSAMLoader(Dataset):
         elif img.shape[-1] > 3:
             img = img[:, :, :3]
 
+        # Load pre-computed flow if available (and compute_flows is True)
+        flow = None
+        if self.compute_flows and sample["flow_path"] is not None:
+            flow = self._load_flow(sample["flow_path"])  # (2, H, W)
+
         # Normalize to percentiles BEFORE augmentation
         img = self._normalize_percentile(img)
 
-        # Random rotation, flipping, and resizing
-        img, mask = self._random_rotate_and_resize(img, mask, diameter)
+        # Random rotation, flipping, and resizing (apply to img, mask, and flow)
+        img, mask, flow = self._random_rotate_and_resize(img, mask, diameter, flow)
 
-        # Random crop to 256x256
-        img, mask = self._random_crop(img, mask)
+        # Random crop to 256x256 (apply to img, mask, and flow)
+        img, mask, flow = self._random_crop(img, mask, flow)
 
         # Convert to grayscale with 10% probability
         if np.random.rand() < self.grayscale_prob:
@@ -470,17 +559,20 @@ class CellposeSAMLoader(Dataset):
         # Apply channel augmentations
         img = self._augment_channels(img)
 
-        # Compute flows from mask
+        # Prepare labels
         if self.compute_flows:
-            # Compute cell probability and flows
+            # Compute cell probability
             cellprob = (mask > 0).astype(np.float32)
 
-            # Compute flows using Cellpose dynamics
-            flows = dynamics.labels_to_flows(mask[np.newaxis, :, :])[
-                0
-            ]  # Returns (3, H, W)
-            flow_y = flows[1]  # Y flow
-            flow_x = flows[2]  # X flow
+            if flow is not None:
+                # Use pre-computed flow
+                flow_y = flow[0]  # (H, W)
+                flow_x = flow[1]  # (H, W)
+            else:
+                # Fallback: compute flows on-the-fly
+                flows = dynamics.labels_to_flows(mask[np.newaxis, :, :])[0]  # (3, H, W)
+                flow_y = flows[1]
+                flow_x = flows[2]
 
             # Stack: [cellprob, flowY, flowX]
             labels = np.stack([cellprob, flow_y, flow_x], axis=0)  # (3, H, W)
@@ -490,9 +582,7 @@ class CellposeSAMLoader(Dataset):
 
         # Convert to torch tensors
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).to(self.dtype)  # (3, H, W)
-        labels_tensor = torch.from_numpy(labels).to(
-            self.dtype
-        )  # (3, H, W) or (1, H, W)
+        labels_tensor = torch.from_numpy(labels).to(self.dtype)  # (3, H, W) or (1, H, W)
 
         return {"pixel_values": img_tensor, "labels": labels_tensor}
 

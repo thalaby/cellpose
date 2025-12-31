@@ -53,7 +53,7 @@ def _extend_centers_gpu(neighbors, meds, isneighbor, shape, n_iter=200,
         dy = grads[0] - grads[1]
         dx = grads[2] - grads[3]
         del grads
-        mu_torch = np.stack((dy.cpu().squeeze(0), dx.cpu().squeeze(0)), axis=-2)
+        mu_torch = np.stack((dy.cpu().numpy(), dx.cpu().numpy()), axis=0)
     else:
         grads = T[tuple(neighbors[:, 1:])]
         del neighbors
@@ -62,7 +62,7 @@ def _extend_centers_gpu(neighbors, meds, isneighbor, shape, n_iter=200,
         dx = grads[4] - grads[5]
         del grads
         mu_torch = np.stack(
-            (dz.cpu().squeeze(0), dy.cpu().squeeze(0), dx.cpu().squeeze(0)), axis=-2)
+            (dz.cpu().numpy(), dy.cpu().numpy(), dx.cpu().numpy()), axis=0)
     return mu_torch
 
 def center_of_mass(mask):

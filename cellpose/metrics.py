@@ -136,7 +136,8 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
                 tp[n, k] = _true_positive(iou, th)
         fp[n] = n_pred[n] - tp[n]
         fn[n] = n_true[n] - tp[n]
-        ap[n] = tp[n] / (tp[n] + fp[n] + fn[n])
+        denom = tp[n] + fp[n] + fn[n]
+        ap[n] = np.where(denom > 0, tp[n] / denom, 0.0)
 
     if not_list:
         ap, tp, fp, fn = ap[0], tp[0], fp[0], fn[0]

@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers.trainer_utils import EvalLoopOutput
 from cellpose import dynamics, train
 from cellpose.Mobile.models.vit_tiny import SAMStyleTinyViTEncoder
+from cellpose.Mobile.models.train_utils import perform_test
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,16 @@ class DecoderTrainer(Trainer):
 
         Args:
             model: StudentSegmentationModel (encoder + decoder)
-            inputs: dict with 'pixel_values' (images), 'labels' (masks), and optionally 'flows' (precomputed)
+            inputs: dict with 'pixel_values' (images), 'labels' (flows)
         """
 
         pixel_values = inputs["pixel_values"]
-        # masks = inputs["labels"]  # (B, 1, H, W)
+        labels = inputs["labels"]  # (B, 3, H, W)
+        cellprobs = labels[:, 0:1, :, :]  # (B, 1, H, W)
+        flowsY = labels[:, 1:2, :, :]  # (B, 1, H, W)
+        flowsX = labels[:, 2:3, :, :]  # (B, 1, H, W)
+        flows = torch.cat([cellprobs, flowsY, flowsX], dim=1)
+
         # Forward pass through model
         student_outputs = model(pixel_values)  # outputs: (B, 3, H, W) - flows + cellprob
         with torch.no_grad():
@@ -48,128 +54,105 @@ class DecoderTrainer(Trainer):
             teacher_outputs = teacher_raw[0] if isinstance(teacher_raw, (list, tuple)) else teacher_raw
         # batch_size = masks.shape[0]
         device = student_outputs.device
-
-        # Check if precomputed flows are available
-        # if "flows" in inputs and inputs["flows"] is not None:
-        #     # Use precomputed flows (B, 4, H, W): [labels, cellprob, dY, dX]
-        #     precomputed_flows = inputs["flows"].to(device)
-        #     # Extract [cellprob, dY, dX] - skip labels channel
-        #     flows_gt_batch = precomputed_flows[:, 1:, :, :]  # (B, 3, H, W)
-        # else:
-        #     # Fall back to computing flows on-the-fly
-        #     flows_gt = []
-        #     for i in range(batch_size):
-        #         mask_np = masks[i, 0].cpu().numpy()  # (H, W)
-
-        #         # Convert mask to flows using Cellpose dynamics
-        #         # labels_to_flows returns: (4, H, W): [labels, cellprob, dY, dX]
-        #         flows = dynamics.labels_to_flows([mask_np])
-        #         # flows is a list with one element: (4, H, W) array
-        #         flow = flows[0][1:]  # (3, H, W): [cellprob, dY, dX]
-        #         flows_gt.append(torch.from_numpy(flow).float())
-
-        #     # Stack flows into batch tensor
-        #     flows_gt_batch = torch.stack(flows_gt).to(device)  # (B, 3, H, W)
-
-        # Compute Cellpose segmentation loss
-        # train._loss_fn_seg expects: (lbl, y) where lbl is ground truth flows and y is predictions
-        # Expected lbl shape (B, 4, H, W) with channel order [labels, cellprob, dY, dX]
-        # Student outputs are expected as (B, 3, H, W) in order [dY, dX, cellprob]
-
         # Move teacher outputs to the same device/dtype as student outputs
         teacher_outputs = teacher_outputs.to(device)
-
-        # Normalize dimensionality: if teacher outputs are (B, H, W, C) convert to (B, C, H, W)
-        if teacher_outputs.ndim == 4 and teacher_outputs.shape[-1] in (3, 4):
-            # (B, H, W, C) -> (B, C, H, W)
-            teacher_outputs = teacher_outputs.permute(0, 3, 1, 2)
-
-        if teacher_outputs.ndim != 4:
-            raise ValueError(f"Unexpected teacher output shape: {teacher_outputs.shape}")
-
-        C = teacher_outputs.shape[1]
-        if C == 4:
-            # assume order already [labels, cellprob, dY, dX]
-            flows_gt_batch = teacher_outputs
-        elif C == 3:
-            # assume teacher gives [dY, dX, cellprob] (same as student)
-            # convert to [labels=zeros, cellprob, dY, dX]
-            b, _, h, w = teacher_outputs.shape
-            zeros = torch.zeros((b, 1, h, w), device=device, dtype=teacher_outputs.dtype)
-            cellprob = teacher_outputs[:, 2:3, :, :]
-            dy_dx = teacher_outputs[:, 0:2, :, :]
-            flows_gt_batch = torch.cat([zeros, cellprob, dy_dx], dim=1)
-        else:
-            raise ValueError(f"Teacher outputs have unsupported channel count: {C}")
-
-        loss = train._loss_fn_seg(flows_gt_batch, student_outputs, device)
+        loss = train._loss_fn_seg(flows, student_outputs, device)
 
         return (loss, {"predictions": student_outputs}) if return_outputs else loss
 
-    def evaluation_loop(
-        self,
-        dataloader,
-        description,
-        prediction_loss_only=None,
-        ignore_keys=None,
-        metric_key_prefix: str = "eval",
-    ):
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """
-        Custom evaluation loop that computes validation loss.
+        Override prediction_step to ensure loss is computed during evaluation.
         """
-
-        self.model.eval()
-        device = self.args.device
-
-        total_loss = 0.0
-        num_batches = 0
-
-        logger.info(f"Running {metric_key_prefix} with Cellpose segmentation loss...")
-
+        has_labels = "labels" in inputs
+        inputs = self._prepare_inputs(inputs)
+        
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc=description):
-                pixel_values = batch["pixel_values"].to(device)
-                masks = batch["labels"].to(device)
+            if has_labels:
+                loss = self.compute_loss(model, inputs, return_outputs=False)
+                loss = loss.detach()
+            else:
+                loss = None
+            
+        return (loss, None, None)
 
-                # Forward pass
-                outputs = self.model(pixel_values)
-
-                batch_size = masks.shape[0]
-
-                # Convert masks to flows
-                flows_gt = []
-                for i in range(batch_size):
-                    mask_np = masks[i, 0].cpu().numpy()
-                    flows = dynamics.labels_to_flows([mask_np])
-                    flow = flows[0]
-                    flows_gt.append(torch.from_numpy(flow).float())
-
-                flows_gt_batch = torch.stack(flows_gt).to(device)
-
-                # Compute loss
-                loss = train._loss_fn_seg(flows_gt_batch, outputs, device)
-                total_loss += loss.item()
-                num_batches += 1
-
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        metrics = {f"{metric_key_prefix}_loss": avg_loss}
-
-        logger.info(f"{metric_key_prefix.capitalize()} final loss: {avg_loss:.6f}")
-
-        self.model.train()
-
-        return EvalLoopOutput(
-            predictions=None,
-            label_ids=None,
-            metrics=metrics,
-            num_samples=len(dataloader.dataset),
+    def evaluate_loss(self, eval_dataset=None, batch_size=None):
+        """
+        Basic evaluation loop that computes the same loss as compute_loss.
+        
+        Args:
+            eval_dataset: Dataset to evaluate on. If None, uses self.eval_dataset
+            batch_size: Batch size for evaluation. If None, uses per_device_eval_batch_size
+            
+        Returns:
+            dict: Dictionary containing average loss and number of samples
+        """
+        if eval_dataset is None:
+            eval_dataset = self.eval_dataset
+        
+        if eval_dataset is None:
+            logger.warning("No evaluation dataset provided")
+            return {}
+        
+        if batch_size is None:
+            batch_size = self.args.per_device_eval_batch_size
+        
+        # Get device - use model's device if args.device not available
+        device = getattr(self.args, 'device', None)
+        if device is None:
+            device = next(self.model.parameters()).device
+        
+        # Create dataloader
+        from torch.utils.data import DataLoader
+        dataloader = DataLoader(
+            eval_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=self.args.dataloader_num_workers,
+            collate_fn=self.data_collator,
         )
+        
+        # Set model to eval mode
+        self.model.eval()
+        
+        total_loss = 0.0
+        num_samples = 0
+        
+        logger.info(f"Running evaluation on {len(eval_dataset)} samples...")
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Evaluating"):
+                # Move batch to device
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                # Compute loss using the same logic as compute_loss
+                loss = self.compute_loss(self.model, batch, return_outputs=False)
+                
+                batch_size_actual = batch["pixel_values"].shape[0]
+                total_loss += loss.item() * batch_size_actual
+                num_samples += batch_size_actual
+        
+        # Set model back to train mode
+        self.model.train()
+        
+        avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
+        
+        result = {
+            "eval_loss": avg_loss,
+            "eval_samples": num_samples,
+        }
+        
+        logger.info(f"Evaluation results: {result}")
+        
+        return result
 
     def test(
         self,
         test_dataset=None,
         metric_key_prefix="test",
         log_every_n=10,
+        model_name="decoder_model",
     ):
         """
         Run final test with segmentation metrics on image-mask pairs.
@@ -180,86 +163,15 @@ class DecoderTrainer(Trainer):
             test_dataset: Dataset with image-mask pairs for segmentation evaluation
             log_every_n: Log metrics to wandb every n samples (default: 10)
         """
-        from cellpose import metrics
+        
+        return perform_test(
+            model=self.cellpose_model,
+            test_dataset=test_dataset,
+            metric_key_prefix=metric_key_prefix,
+            model_name=model_name,
+            report_wandb=self.args.report_to and "wandb" in self.args.report_to,
+        )
 
-        if test_dataset is None:
-            raise ValueError("No test dataset provided")
-
-        # Ensure model is in eval mode
-        self.model.eval()
-        device = self.args.device
-
-        masks_gt_all = []
-        masks_pred_all = []
-
-        # Create dataloader for test
-        for dataset_name in test_dataset.keys():
-            print(
-                f"Test dataset: {dataset_name}, samples: {len(test_dataset[dataset_name])}"
-            )
-
-            print(f"\nRunning segmentation test on {len(test_dataset)} samples...")
-
-            sample_count = 0
-            threshold = [0.5, 0.75, 0.9]
-            with torch.no_grad():
-                for image in tqdm(test_dataset[dataset_name], desc="Testing"):
-                    # Extract images and masks from batch dict
-                    img = image["pixel_values"].to(device)
-                    masks_gt = image["labels"]
-                    img = img.permute(1, 2, 0)  # (C, H, W) -> (H, W, C)
-                    mask_gt = masks_gt.squeeze().cpu().numpy().astype(np.int16)
-
-                    # Run cellpose evaluation
-                    masks_pred, flows, styles = self.cellpose_model.eval(img)
-
-                    masks_gt_all.append(mask_gt)
-                    masks_pred_all.append(masks_pred)
-                    sample_count += 1
-
-                    # # Log intermediate metrics every n samples
-                    if sample_count % log_every_n == 0 and self.args.report_to and "wandb" in self.args.report_to:
-                        import wandb
-                        # Compute metrics on accumulated samples so far
-                        ap_partial, tp_partial, fp_partial, fn_partial = metrics.average_precision(
-                            masks_gt_all, masks_pred_all
-                        )
-                        for i, thr in enumerate(threshold):
-                            wandb.log({
-                                f"{metric_key_prefix}_{thr}_ap_at_{dataset_name}": ap_partial[i],
-                                f"{metric_key_prefix}_{thr}_tp_at_{dataset_name}": tp_partial[i],
-                                f"{metric_key_prefix}_{thr}_fp_at_{dataset_name}": fp_partial[i],
-                                f"{metric_key_prefix}_{thr}_fn_at_{dataset_name}": fn_partial[i],
-                                f"{metric_key_prefix}_samples_evaluated": sample_count,
-                            })
-
-        # Compute final metrics
-        ap, tp, fp, fn = metrics.average_precision(masks_gt_all, masks_pred_all)
-        test_metrics = {}
-        for i, thr in enumerate(threshold):
-            test_metrics[i] = {
-                f"{metric_key_prefix}_{thr}_mean_ap": ap[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_tp": tp[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_fp": fp[:, i].mean(),
-                f"{metric_key_prefix}_{thr}_mean_fn": fn[:, i].mean(),
-                f"{metric_key_prefix}_total_samples": sample_count,
-            }
-
-        # Log final metrics to wandb
-        if self.args.report_to and "wandb" in self.args.report_to:
-            import wandb
-
-            for i, thr in enumerate(threshold):
-                wandb.log(test_metrics[i])
-
-        # Print results
-        print(f"\nTest Results ({sample_count} samples):")
-        print(f"  Mean AP: {ap[:, 0].mean():.4f}")
-        print(f"  Mean TP: {tp[:, 0].mean():.4f}")
-        print(f"  Mean FP: {fp[:, 0].mean():.4f}")
-        print(f"  Mean FN: {fn[:, 0].mean():.4f}")
-
-        return test_metrics
 
 
 class StudentSegmentationModelDecoderTrain(nn.Module):
@@ -270,7 +182,13 @@ class StudentSegmentationModelDecoderTrain(nn.Module):
         self.device = device
         self.dtype = dtype
 
-    def forward(self, x):
+    def forward(self, x=None, pixel_values=None, **kwargs):
+        # Handle both direct input and dict-style input from Trainer
+        if x is None:
+            x = pixel_values
+        if x is None:
+            raise ValueError("Either 'x' or 'pixel_values' must be provided")
+        
         with torch.no_grad():
             feat = self.encoder(x)  # neck output
         out = self.decoder(feat)

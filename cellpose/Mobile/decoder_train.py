@@ -17,7 +17,7 @@ from cellpose.Mobile.models.decoder_utils import (
     load_encoder,
 )
 from cellpose.Mobile.utils.dataset_utils import (
-    get_train_val_dataset_decoder,
+    get_train_val_dataset_formatted,
     get_test_dataset,
     get_train_dataset_sa1b,
 )
@@ -39,7 +39,6 @@ def collate_fn(batch):
     # Stack fixed-size tensors
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
-    flows = torch.stack([item["flows"] for item in batch])
 
     # class_ids is variable length, so we don't stack it (not needed for training)
     # If needed in the future, could pad or use a list
@@ -47,7 +46,6 @@ def collate_fn(batch):
     return {
         "pixel_values": pixel_values,
         "labels": labels,
-        "flows": flows,
     }
 
 
@@ -58,18 +56,18 @@ def create_training_args(output_dir="./decoder_output", **kwargs):
     default_args = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
-        "num_train_epochs": 4,
-        "per_device_train_batch_size": 4,
-        "per_device_eval_batch_size": 4,
-        "dataloader_num_workers": 1,
-        "learning_rate": 1e-4,
+        "num_train_epochs": 100,
+        "per_device_train_batch_size": 256,
+        "per_device_eval_batch_size": 256,
+        "dataloader_num_workers": 8,
+        "learning_rate": 1e-5,
         "warmup_steps": 500,
         "weight_decay": 0.01,
         "logging_dir": "./logs",
-        "logging_steps": 100,
+        "logging_steps": 10,
         "eval_steps": 500,
-        "save_steps": 500,
-        "save_total_limit": 3,
+        "save_steps": 2000,
+        "save_total_limit": 5,
         "eval_strategy": "epoch",
         "seed": 42,
         "fp16": False,
@@ -106,7 +104,7 @@ def main(
     distillation_model = DistillationModel(student_encoder, teacher_encoder)
     distillation_model.to(device, dtype=dtype)
     state_dict = load_file(
-        "good_checkpoints/checkpoint-post-cell/model.safetensors", device="cpu"
+        "good_checkpoints/checkpoint-post-distilled-cell-2712/model.safetensors", device="cpu"
     )
     distillation_model.load_state_dict(state_dict)
     distillation_model.to(device, dtype=dtype)
@@ -124,8 +122,8 @@ def main(
 
     # Load datasets
     logger.info("Loading training and validation datasets...")
-    # train_dataset, val_dataset = get_train_val_dataset_decoder()
-    train_dataset, val_dataset = get_train_dataset_sa1b()
+    train_dataset, val_dataset = get_train_val_dataset_formatted(flows=True)
+    # train_dataset, val_dataset = get_train_dataset_sa1b()
 
     logger.info(f"Training dataset: {len(train_dataset)} samples")
     logger.info(f"Validation dataset: {len(val_dataset)} samples")
@@ -143,16 +141,18 @@ def main(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        data_collator=collate_fn,
     )
 
     # Start training
     logger.info("Starting decoder training...")
     trainer.teacher_model = teacher_model.to(device, dtype)
     trainer.train()
-    cellpose_model = create_cellpose_model(
+    cellpose_distilled = create_cellpose_model(
         student_model.encoder, student_model.decoder, device=device
     )
-    trainer.cellpose_model = cellpose_model
+
+    trainer.cellpose_model = cellpose_distilled
     # Save the decoder
     logger.info(f"Saving decoder to {output_dir}/decoder.pt")
     Path(output_dir).mkdir(parents=True, exist_ok=True)

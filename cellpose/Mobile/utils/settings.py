@@ -24,7 +24,7 @@ TEST_DATASET_PATHS = [
             ("Deepcell-Tissuenet", Path(DATA_PATH, "Deepcell/tissuenet", 'test')),
             ("Deepcell-DynamicNuclearNet", Path(DATA_PATH, "Deepcell/DynamicNuclearNet-segmentation-v1_0", 'test'))
         ]
-CELL_TRAIN_DATASET_PATHS = [
+CELL_TRAIN_DATASET_PATHS_LABELED = [
                        Path(DATA_PATH, 'Cellpose', 'train'),
                        Path(DATA_PATH, 'CellposeN', 'train'),
                        Path(DATA_PATH, 'CPM15', 'cpm15', 'Images'),
@@ -50,10 +50,12 @@ CELL_TRAIN_DATASET_PATHS = [
                        Path(DATA_PATH, "PanNuke", 'Fold 3', 'images', 'fold3'),
                        Path(DATA_PATH, "YeaZ", 'gold-standard-BF-V-1'),
                     #    Path(DATA_PATH, "YeaZ", 'gold-standard-PhC-plus-2'), 3D images
-                       Path(DATA_PATH, "NeurIPS", 'release-part1'),
-                       Path(DATA_PATH, "NeurIPS", 'train-unlabeled-part2'),
                        Path(DATA_PATH, "NeurIPS", 'Training-labeled', 'images'),
                        ]
+
+CELL_TRAIN_DATASET_PATHS_UNLABELED = [
+                       Path(DATA_PATH, "NeurIPS", 'release-part1'),
+                       Path(DATA_PATH, "NeurIPS", 'train-unlabeled-part2'),]
 
 CELL_TRAIN_DATASET_PATHS_DECODER = [Path(DATA_PATH, "CellposeNDecoder/train"),
                                     Path(DATA_PATH, "CellposeDecoder/train")]
@@ -63,7 +65,9 @@ CELL_TRAIN_DATASET_PATHS_DECODER = [Path(DATA_PATH, "CellposeNDecoder/train"),
 SA1B_TRAIN_DATASET_PATH = [SA1B_DATASET_PATH + "/images"]
 
 TRAINING_ARGS = {"train_on_cellular": True,
-                 "train": True,
+                 "test_original_cellpose": True,
+                 "test_trained_model": True,
+                 "train": False,
                  "train_batch_size": 1,
                  "eval_batch_size": 1,
                  "eval_log_steps": 500

@@ -7,7 +7,8 @@ import logging
 import tifffile
 
 from cellpose.Mobile.utils.settings import (
-    CELL_TRAIN_DATASET_PATHS,
+    CELL_TRAIN_DATASET_PATHS_LABELED,
+    CELL_TRAIN_DATASET_PATHS_UNLABELED,
     TEST_DATASET_PATHS,
     SA1B_TRAIN_DATASET_PATH,
     TRAINING_ARGS,
@@ -106,7 +107,7 @@ class TiledImageMaskDataset(Dataset):
         print(
             f"TiledImageMaskDataset '{self.name}': {len(self)} tiles from {len(self.image_files)} images ({mask_status})"
         )
-    
+
     def enable_image_caching(self, enable=True):
         """Enable or disable image caching."""
         self.enable_cache = enable
@@ -241,23 +242,35 @@ class TiledImageMaskDataset(Dataset):
                 mask = tifffile.imread(str(mask_path))
             except Exception:
                 mask = np.array(Image.open(mask_path))
-            
-            assert mask.shape == img.shape[:2], f"Mask shape {mask.shape} does not match image shape {img.shape[:2]} for mask_path {mask_path}"
+
+            assert mask.shape == img.shape[:2], (
+                f"Mask shape {mask.shape} does not match image shape {img.shape[:2]} for mask_path {mask_path}"
+            )
 
             # Ensure mask is 2D
             if mask.ndim == 3:
                 mask = mask[:, :, 0] if mask.shape[2] > 1 else mask.squeeze(-1)
 
             mask_tile = mask[y : y + tile_h, x : x + tile_w]
-            
+
             # Convert to PyTorch-compatible dtype if needed
             # PyTorch doesn't support ulonglong, so convert to a supported type
             if mask_tile.dtype == np.ulonglong or mask_tile.dtype == np.longlong:
                 mask_tile = mask_tile.astype(np.int64)
-            elif mask_tile.dtype not in [np.float64, np.float32, np.float16, 
-                                          np.int64, np.int32, np.int16, np.int8,
-                                          np.uint64, np.uint32, np.uint16, np.uint8,
-                                          bool]:
+            elif mask_tile.dtype not in [
+                np.float64,
+                np.float32,
+                np.float16,
+                np.int64,
+                np.int32,
+                np.int16,
+                np.int8,
+                np.uint64,
+                np.uint32,
+                np.uint16,
+                np.uint8,
+                bool,
+            ]:
                 # Fallback: convert unsupported types to float32
                 mask_tile = mask_tile.astype(np.float32)
         else:
@@ -316,12 +329,12 @@ class ImageMaskDataset(Dataset):
     """
     Loads image/mask pairs from a folder.
     Expected format:
-        000_img.png
-        000_masks.png
-        001_img.png
-        001_masks.png
+        000_img.tif
+        000_masks.tif
+        001_img.tif
+        001_masks.tif
         ...
-    Supports images of type PNG, JPG, and TIFF.
+    Only supports TIFF images.
     """
 
     def __init__(
@@ -337,13 +350,10 @@ class ImageMaskDataset(Dataset):
         self.mask_suffix = mask_suffix
         self.dtype = dtype
         self.name = name
-        # Supported image extensions (lowercase)
-        self.img_extensions = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+        # Only support TIFF extensions
+        self.img_extensions = [".tif", ".tiff"]
 
         files = os.listdir(root_dir)
-        # Optional: debug print
-        # print("Files in dir:", files)
-
         prefixes = set()
 
         for f in files:
@@ -353,7 +363,7 @@ class ImageMaskDataset(Dataset):
             name, ext = os.path.splitext(f)
             ext = ext.lower()
 
-            # Check if this file looks like an image file with the img_suffix
+            # Check if this file looks like a TIFF image file with the img_suffix
             if ext in self.img_extensions and name.endswith(self.img_suffix):
                 # prefix is everything before the suffix, e.g. "000" in "000_img"
                 prefix = name[: -len(self.img_suffix)]
@@ -364,8 +374,7 @@ class ImageMaskDataset(Dataset):
         if len(self.prefixes) == 0:
             # Helpful debug message
             raise RuntimeError(
-                f"No *{self.img_suffix}* files with supported extensions "
-                f"({self.img_extensions}) found in directory: {root_dir}\n"
+                f"No *{self.img_suffix}* TIFF files found in directory: {root_dir}\n"
                 f"Example files seen: {files[:10]}"
             )
 
@@ -377,42 +386,66 @@ class ImageMaskDataset(Dataset):
     def __getitem__(self, idx):
         prefix = self.prefixes[idx]
 
-        # Find the image and mask paths with supported extensions
-        img_path = next(
-            os.path.join(self.root_dir, prefix + self.img_suffix + ext)
-            for ext in self.img_extensions
-            if os.path.exists(
-                os.path.join(self.root_dir, prefix + self.img_suffix + ext)
-            )
-        )
-        mask_path = next(
-            os.path.join(self.root_dir, prefix + self.mask_suffix + ext)
-            for ext in self.img_extensions
-            if os.path.exists(
-                os.path.join(self.root_dir, prefix + self.mask_suffix + ext)
-            )
-        )
+        # Find the image and mask paths with TIFF extensions
+        img_path = os.path.join(self.root_dir, prefix + self.img_suffix + ".tif")
+        mask_path = os.path.join(self.root_dir, prefix + self.mask_suffix + ".tif")
 
-        # Load images
-        img = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path)
+        if not os.path.exists(img_path) or not os.path.exists(mask_path):
+            raise FileNotFoundError(
+                f"Image or mask file not found for prefix '{prefix}' in {self.root_dir}"
+            )
 
-        # Convert to numpy
-        img = np.array(img)  # (H, W, 3)
-        mask = np.array(mask)  # (H, W)
+        # Load images using tifffile for better TIFF support
+        try:
+            img = tifffile.imread(str(img_path))
+        except Exception:
+            # Fallback to PIL
+            img = np.array(Image.open(img_path))
+        
+        try:
+            mask = tifffile.imread(str(mask_path))
+        except Exception:
+            # Fallback to PIL
+            mask = np.array(Image.open(mask_path))
+
+        # Ensure image is RGB (H, W, 3)
+        if img.ndim == 2:  # Grayscale
+            img = np.stack([img, img, img], axis=-1)
+        elif img.ndim == 3:
+            if img.shape[0] == 3:  # (3, H, W) format
+                img = np.transpose(img, (1, 2, 0))  # Convert to (H, W, 3)
+            elif img.shape[-1] == 1:  # (H, W, 1) format
+                img = np.repeat(img, 3, axis=-1)
+            elif img.shape[-1] == 2:  # (H, W, 2) format
+                img = np.concatenate([img, img[:, :, :1]], axis=-1)
+            elif img.shape[-1] > 3:  # More than 3 channels
+                img = img[:, :, :3]
+        # else: already (H, W, 3)
+
+        # Ensure mask is 2D (H, W)
+        if mask.ndim == 3:
+            if mask.shape[0] == 1:  # (1, H, W) format
+                mask = mask[0]
+            elif mask.shape[-1] == 1:  # (H, W, 1) format
+                mask = mask[:, :, 0]
+            else:  # Take first channel
+                mask = mask[:, :, 0] if mask.shape[-1] > 1 else mask[0]
+
+        # Normalize image to [0, 1]
+        if img.dtype == np.uint8:
+            img = img.astype(np.float32) / 255.0
+        elif img.dtype == np.uint16:
+            img = img.astype(np.float32) / 65535.0
+        else:
+            img = img.astype(np.float32)
+            if img.max() > 1.0:
+                img = img / img.max()
 
         # Convert to torch tensors
-        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        img = img.to(self.dtype)
+        img = torch.from_numpy(img).permute(2, 0, 1).to(self.dtype)  # (3, H, W)
 
         # Mask shape -> (1, H, W)
-        mask = torch.from_numpy(mask)
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0)
-        else:
-            mask = mask.permute(2, 0, 1)[:1]
-
-        mask = mask.to(self.dtype)
+        mask = torch.from_numpy(mask).unsqueeze(0).to(self.dtype)
 
         return {"pixel_values": img, "labels": mask}
 
@@ -563,7 +596,7 @@ class NPZImageMaskDataset(Dataset):
             )
             img_tensor = torch.cat([img_tensor, padding], dim=0)
         # flows = dynamics.labels_to_flows(mask_tensor)[0]
-        return {"pixel_values": img_tensor, "labels": mask_tensor} # , "flows": flows}
+        return {"pixel_values": img_tensor, "labels": mask_tensor}  # , "flows": flows}
 
 
 class DistillationDatasetWrapperIndex(Dataset):
@@ -723,13 +756,20 @@ def get_train_val_dataset_distilled():
     return combined_train_dataset, combined_val_dataset
 
 
-def get_test_dataset():
+def get_test_dataset(partial=False):
     datasets = {}
-    for name, path in TEST_DATASET_PATHS:
-        if str(path).endswith(".npz"):
-            ds = NPZImageMaskDataset(path, dtype=torch.float32, name=name)
-        else:
-            ds = ImageMaskDataset(path, dtype=torch.float32, name=name)
+    img_suffix = "_im"
+    mask_suffix = "_mask"
+    dtype = torch.float32
+    test_paths = TEST_DATASET_PATHS[:3] if partial else TEST_DATASET_PATHS
+    for name, path in test_paths:
+        ds = ImageMaskDataset(
+            path,
+            name=name,
+            dtype=dtype,
+            img_suffix=img_suffix,
+            mask_suffix=mask_suffix,
+        )
         datasets[name] = ds
     return datasets
 
@@ -782,7 +822,7 @@ def get_val_dataset():
 
 
 def load_dataset_auto(
-    path, dtype=torch.float32, name=None, img_suffix="_im", mask_suffix="_mask"
+    path, dtype=torch.float32, name=None, img_suffix="_im", mask_suffix="_mask", flows=False
 ):
     """
     Automatically detect and load the appropriate dataset type based on path contents.
@@ -817,13 +857,13 @@ def load_dataset_auto(
             img_suffix=img_suffix,
             mask_suffix=mask_suffix,
             enable_cache=False,
-            compute_flows=False,
+            compute_flows=flows,
         )
-        t0 = time.time()
-        sample_load_timed = ds[random.randint(0, len(ds) - 1)]
-        t1 = time.time()
-        if t1 - t0 > 0.1:
-            ds.enable_image_caching(True)
+        # t0 = time.time()
+        # sample_load_timed = ds[random.randint(0, len(ds) - 1)]
+        # t1 = time.time()
+        # if t1 - t0 > 0.1:
+        #     ds.enable_image_caching(True)
         return ds
 
     # Fallback to ImageMaskDataset
@@ -836,7 +876,7 @@ def load_dataset_auto(
     )
 
 
-def get_train_val_dataset_formatted():
+def get_train_val_dataset_formatted(flows=False, test_mode=False, minimal=False):
     """
     Load training and validation datasets from Data/CellDatasets/Formatted.
     Automatically detects whether to use TiledImageMaskDataset or ImageMaskDataset
@@ -849,17 +889,23 @@ def get_train_val_dataset_formatted():
     val_datasets = []
 
     paths = (
-        CELL_TRAIN_DATASET_PATHS
+        CELL_TRAIN_DATASET_PATHS_LABELED
         if TRAINING_ARGS.get("train_on_cellular", True)
         else SA1B_TRAIN_DATASET_PATH
     )
+
+    if not flows:
+        paths.extend(CELL_TRAIN_DATASET_PATHS_UNLABELED)
+    
+    if minimal:
+        paths = paths[:1]
 
     for path in paths:
         path = Path(path)
 
         # Load dataset with auto-detection
         ds = load_dataset_auto(
-            path, dtype=torch.float32, img_suffix="_im", mask_suffix="_mask"
+            path, dtype=torch.float32, img_suffix="_im", mask_suffix="_mask", flows=flows
         )
 
         # If it's an NPZ dataset, no splitting needed (usually pre-split)
@@ -879,9 +925,10 @@ def get_train_val_dataset_formatted():
             else:
                 train_datasets.append(ds)
 
-
     # Combine all datasets
     combined_train_dataset = DistillationDatasetWrapperIndex(datasets=train_datasets)
     combined_val_dataset = DistillationDatasetWrapperIndex(datasets=val_datasets)
-
-    return combined_train_dataset, combined_val_dataset
+    if test_mode:
+        return train_datasets, val_datasets
+    else:
+        return combined_train_dataset, combined_val_dataset

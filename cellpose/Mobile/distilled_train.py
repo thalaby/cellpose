@@ -39,10 +39,10 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
     default_args = {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
-        "num_train_epochs": 50,
-        "per_device_train_batch_size": 256,
-        "per_device_eval_batch_size": 256,
-        "dataloader_num_workers": 8,  # Use 4 workers with proper multiprocessing configuration
+        "num_train_epochs": 100,
+        "per_device_train_batch_size": 128,
+        "per_device_eval_batch_size": 128,
+        "dataloader_num_workers": 4,  # Use 4 workers with proper multiprocessing configuration
         "dataloader_persistent_workers": True,  # Keep workers alive between epochs for efficiency
         "dataloader_prefetch_factor": 2,  # Prefetch 2 batches per worker
         "learning_rate": 5e-4,
@@ -51,14 +51,14 @@ def create_training_args(output_dir="./distillation_output", **kwargs):
         "logging_dir": "./logs",
         "logging_steps": 10,
         "save_steps": 5000,
-        "save_total_limit": 3,
+        "save_total_limit": 5,
         "seed": 42,
         "fp16": False,  # Disable FP16 since models are already float16
         "gradient_accumulation_steps": 1,
         "remove_unused_columns": False,
         "report_to": "wandb",
         "eval_strategy": "epoch",  # Run validation after every epoch
-        "save_strategy": "epoch",  # Save checkpoint after every epoch
+        "save_strategy": "steps",  # Save checkpoint after every epoch
     }
     default_args.update(kwargs)
     return TrainingArguments(**default_args)
@@ -95,8 +95,8 @@ def main(
     
     # Create test dataset from multiple paths
     logger.info("Creating test dataset...")
-    # test_dataset = get_test_dataset()
-    # logger.info(f"test tiles: {len(test_dataset)}")
+    test_dataset = get_test_dataset()
+    logger.info(f"test tiles: {len(test_dataset)}")
 
     logger.info("Creating training dataset for distilled train...")
     train_dataset, eval_dataset = get_train_val_dataset_formatted()
@@ -127,24 +127,50 @@ def main(
         # Start training
         logger.info("Starting distillation training...")
         trainer.train()
+        # Save the student encoder
+        logger.info(f"Saving student encoder to {output_dir}/student_encoder.pt")
+        torch.save(distillation_model.student_encoder.state_dict(), f"{output_dir}/student_encoder.pt")
+        logger.info("Training completed!")
+    else:
+        # Create distillation model
+        logger.info("Creating distillation model...")
+        logger.info("Loading student encoder state dict from previous  training...")
+        # student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
+        distillation_model = DistillationModel(student_encoder, teacher_encoder)
+        distillation_model.to(device, dtype=dtype)
+        state_dict = load_file('good_checkpoints/checkpoint-post-distilled-cell-2712/model.safetensors', device='cpu')
+        distillation_model.load_state_dict(state_dict)
+        distillation_model = distillation_model.to(device, dtype=dtype)
 
     student_encoder = distillation_model.student_encoder
 
-    # Save the student encoder
-    logger.info(f"Saving student encoder to {output_dir}/student_encoder.pt")
-    torch.save(distillation_model.student_encoder.state_dict(), f"{output_dir}/student_encoder.pt")
-    logger.info("Training completed!")
 
     # Update cellpose model with trained student encoder
     cellpose_model.net = StudentSegmentationModel(distillation_model.student_encoder, student_decoder).to(device)
     
     # Run final test with segmentation metrics
-    logger.info("Starting Test with segmentation metrics on test dataset...")
-    test_metrics = trainer.test(test_dataset=test_dataset)
-    
-    # Save metrics to file
-    np.savez(f"{output_dir}/segmentation_metrics.npz", **test_metrics)
-    logger.info(f"Segmentation test mean AP: {test_metrics['test_mean_ap']:.4f}")
+    if TRAINING_ARGS['test_trained_model']:
+        logger.info("Starting Test with segmentation metrics on test dataset...")
+        test_metrics_trained = trainer.test(test_dataset=test_dataset, model_name="distilled_model")
+        
+        # Save metrics to file
+        np.save(f"{output_dir}/trained_metrics.npy", test_metrics_trained)
+    if TRAINING_ARGS['test_original_cellpose']:
+        logger.info("Testing original Cellpose model for comparison...")
+        cellpose_model_orig = create_cellpose_model(teacher_encoder, student_decoder, device=device)
+        trainer_not_mine = DistillationTrainer(
+        model=distillation_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss_fn=nn.MSELoss(),
+        student_decoder=student_decoder,
+        cellpose_model=cellpose_model_orig,
+        # eval_log_steps=TRAINING_ARGS.get('eval_log_steps', None),  # Log eval metrics every N steps
+        )
+        test_metrics_original = trainer_not_mine.test(test_dataset=test_dataset, model_name="original_cellpose")
+        np.save(f"{output_dir}/original_metrics.npy", test_metrics_original)
+
 
 
 def main_test():
@@ -165,7 +191,7 @@ def main_test():
     # student_encoder.load_state_dict(torch.load('distillation_output/student_encoder.pt'))
     distillation_model = DistillationModel(student_encoder, teacher_encoder)
     distillation_model.to(device, dtype=dtype)
-    state_dict = load_file('distillation_output/checkpoint-6040/model.safetensors', device='cpu')
+    state_dict = load_file('good_checkpoints/checkpoint-post-distilled-cell-2712/model.safetensors', device='cpu')
     distillation_model.load_state_dict(state_dict)
     distillation_model = distillation_model.to(device, dtype=dtype)
 
@@ -177,6 +203,7 @@ def main_test():
     training_args = create_training_args(
         output_dir='test_output',
     )
+    training_args.eval_strategy = "no"
     # Create trainer with evaluation capabilities
     logger.info("Creating trainer...")
     trainer_mine = DistillationTrainer(
