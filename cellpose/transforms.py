@@ -564,7 +564,7 @@ def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
     # check if image is a torch array instead of numpy array, convert to numpy
     ndim = x.ndim
     if torch.is_tensor(x):
-        transforms_logger.warning("torch array used as input, converting to numpy")
+        # transforms_logger.warning("torch array used as input, converting to numpy")
         x = x.cpu().numpy()
 
     # should be 2D
@@ -973,7 +973,7 @@ def random_rotate_and_resize(X, Y=None, scale_range=1., xy=(224, 224), do_3D=Fal
     scale = np.ones(nimg, np.float32)
 
     for n in range(nimg):
-
+        import ipdb; ipdb.set_trace()
         if random_per_image or n == 0:
             Ly, Lx = X[n].shape[-2:]
             # generate random augmentation parameters

@@ -5,8 +5,10 @@ import logging
 import numpy as np
 from tqdm import trange
 from . import transforms, utils
+from torch.profiler import profile, record_function, ProfilerActivity
 
 import torch
+import time
 
 TORCH_ENABLED = True
 
@@ -161,6 +163,36 @@ def _forward(net, x):
     style = _from_device(style)
     return y, style
 
+def _forward_profile(net, x):
+    """Converts images to torch tensors, runs the network model, and returns numpy arrays.
+
+    Args:
+        net (torch.nn.Module): The network model.
+        x (numpy.ndarray): The input images.
+
+    Returns:
+        Tuple[numpy.ndarray, numpy.ndarray]: The output predictions (flows and cellprob) and style features.
+    """
+    X = _to_device(x, device=net.device, dtype=net.dtype)
+    net.eval()
+    with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    with_stack=False  # set True if you want Python stack traces (slower)
+                    ) as prof:
+        with record_function("train_step"):
+            with torch.no_grad():
+                y, style = net(X)[:2]
+    del X
+    # Save to text file
+    table_str = prof.key_averages().table(sort_by="cuda_time_total", row_limit=200)
+
+    with open("profiler_output.txt", "w") as f:
+        f.write(table_str)
+    y = _from_device(y)
+    style = _from_device(style)
+    return y, style
+
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             rsz=None):
@@ -183,7 +215,9 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
             y[...,0] is Y flow; y[...,1] is X flow; y[...,2] is cell probability. 
             style is a 1D array of size 256 summarizing the style of the image, if tiled `style` is averaged over tiles.
     """
+    
     # run network
+    t0 = time.time()
     Lz, Ly0, Lx0, nchan = imgi.shape 
     if rsz is not None:
         if not isinstance(rsz, list) and not isinstance(rsz, np.ndarray):
@@ -204,6 +238,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         ny = 1 if Ly <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Ly / bsize))
         nx = 1 if Lx <= bsize else int(np.ceil((1. + 2 * tile_overlap) * Lx / bsize))
     
+    # core_logger.info(f"Setup time: {time.time() - t0:.4f}s")
     
     # run multiple slices at the same time
     ntiles = ny * nx
@@ -212,8 +247,11 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
     ziterator = (trange(niter, file=tqdm_out, mininterval=30) 
                     if niter > 10 or Lz > 1 else range(niter))
     for k in ziterator:
+        t_iter = time.time()
         inds = np.arange(k * nimgs, min(Lz, (k + 1) * nimgs))
         IMGa = np.zeros((ntiles * len(inds), nchan, ly, lx), "float32")
+        
+        t_tile_prep = time.time()
         for i, b in enumerate(inds):
             # pad image for net so Ly and Lx are divisible by 4
             imgb = transforms.resize_image(imgi[b], rsz=rsz) if rsz is not None else imgi[b].copy()
@@ -223,8 +261,10 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 tile_overlap=tile_overlap)
             IMGa[i * ntiles : (i+1) * ntiles] = np.reshape(IMG, 
                                             (ny * nx, nchan, ly, lx))
+        # core_logger.info(f"Tile preparation time: {time.time() - t_tile_prep:.4f}s")
         
         # run network
+        t_forward = time.time()
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
             ya0, stylea0 = _forward(net, IMGa[bslc])
@@ -234,8 +274,10 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 stylea = np.zeros((IMGa.shape[0], 256), "float32")
             ya[bslc] = ya0
             stylea[bslc] = stylea0
+        # core_logger.info(f"Network forward pass time: {time.time() - t_forward:.4f}s")
 
         # average tiles
+        t_avg = time.time()
         for i, b in enumerate(inds):
             if i==0 and k==0:
                 yf = np.zeros((Lz, nout, Ly, Lx), "float32")
@@ -247,9 +289,9 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 y = np.reshape(y, (-1, 3, ly, lx))
             yfi = transforms.average_tiles(y, ysub, xsub, Lyt, Lxt)
             yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
-            # stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
-            # stylei /= (stylei**2).sum()**0.5
-            # styles[b] = stylei
+        # core_logger.info(f"Tile averaging time: {time.time() - t_avg:.4f}s")
+        # core_logger.info(f"Total iteration time: {time.time() - t_iter:.4f}s")
+    
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
     yf = yf.transpose(0,2,3,1)   
